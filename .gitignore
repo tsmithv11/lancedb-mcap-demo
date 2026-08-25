@@ -214,6 +214,7 @@ tempCodeRunnerFile.py
 # adapters, and prediction caches are reproducible but intentionally local.
 data/
 artifacts/
+artifacts-v2/
 
 # Marimo
 marimo/_static/

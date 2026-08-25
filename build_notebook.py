@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import nbformat as nbf
@@ -7,36 +9,39 @@ ROOT = Path(__file__).resolve().parent
 NOTEBOOK = ROOT / "robotics_data_curation_post_training.ipynb"
 
 
-def md(text: str):
-    return nbf.v4.new_markdown_cell(text.strip())
+def md(source: str):
+    return nbf.v4.new_markdown_cell(source.strip())
 
 
-def code(text: str):
-    return nbf.v4.new_code_cell(text.strip())
+def code(source: str):
+    return nbf.v4.new_code_cell(source.strip())
 
 
 cells = [
     md(
         r"""
-# From Robot Logs to a Better Scene Tagger
-## An end-to-end MCAP → Lance → curation → MLX-VLM post-training experiment on Apple Silicon
+# Curate the drive, then train the model
 
-**Research question.** Can a deliberately curated subset of temporally redundant driving frames match or beat post-training on every available frame—and do so with less data and less training time?
+## A multi-log MCAP → LanceDB → full-VLM-training experiment
 
-**Populated reference run.** Curated post-training reached **0.393 macro F1**, versus **0.358** for raw post-training and **0.279** for the vanilla model. It used 60 rather than 101 training frames (**41% fewer**) and took 31.4 rather than 58.0 seconds (**46% less training time**). These are the measured results below, not assumed outcomes.
+**Research question.** Can a quality-filtered, perceptually and semantically deduplicated subset of autonomous-driving images match or beat full-model post-training on every available frame—and do so with less data and compute?
 
-This notebook runs that experiment against a real Foxglove nuScenes ROS 2 MCAP recording. It treats the model as a **driving-scene understanding and dataset-indexing model**, not an autonomous-driving policy. Ground truth comes only from nuScenes annotations encoded in the recording; model predictions never create labels.
+**Populated reference run.** Curated full training reached **0.535 macro F1**, effectively matching raw full training at **0.537**, while using 161 instead of 187 frames (**14% fewer**) and 78.2 instead of 92.1 seconds (**15% less training time**). Strict JSON compliance improved from **75.8% to 84.8%**. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
 
-The public fixture contains one 19-second scene, so the experiment uses non-overlapping temporal sequences separated by 0.5-second guard bands. Entire sequences—not individual adjacent frames—are assigned to train, validation, or test. This is a leakage-aware local demo, not a statistically conclusive nuScenes benchmark.
+This notebook builds compact MCAP logs from the official nuImages mini release, ingests them into one LanceDB table, computes governed feature columns, curates the training split with a LanceDB Feature Engineering UDTF, and fully fine-tunes a 256M open vision-language model directly from LanceDB rows. It compares the vanilla model, full training on all rows, and full training on curated rows.
+
+The task is **driving-scene tagging**, not vehicle control. Ground truth comes from nuImages 2D annotations. The notebook uses all six camera positions represented in the mini release; it does not use LiDAR, radar, CAN state, multi-camera fusion, or temporal model inputs.
+
+The data workflow is platform-neutral. Full training uses PyTorch and runs on Apple Silicon Metal, NVIDIA CUDA on Windows/Linux, or CPU (CPU is supported but intentionally requires an explicit opt-in because it is slow).
 """
     ),
     md(
         r"""
 ## 0. Reproducible local setup
 
-We pin randomness, keep every large download and generated artifact under this project, and print the relevant Mac and package information. Missing packages are installed into the active notebook kernel; reruns skip packages and assets that are already present.
+All downloads and generated artifacts stay under this project. The first run downloads a 118 MB public dataset archive, a 45 MB semantic feature extractor, and a roughly 0.5 GB VLM. Expensive results use content-derived fingerprints, so changing the data, prompt, model, curation thresholds, or training configuration invalidates the appropriate cache.
 
-The default uses a 2B, 4-bit Qwen2-VL checkpoint through MLX-VLM. On a 32–64 GB Apple Silicon Mac, the complete run is practical; adapters, training exports, predictions, and the Lance table are cached.
+Use Python 3.12. On macOS, the recommended kernel is **Python 3 (lancedb-mcap-demo)** or the project's `.venv`. On Windows, select the interpreter at `.venv\Scripts\python.exe`.
 """
     ),
     code(
@@ -46,34 +51,51 @@ from __future__ import annotations
 import importlib.util, subprocess, sys
 
 REQUIRED = {
-    "lancedb": "lancedb>=0.24",
+    "lancedb": "lancedb==0.37.1",
     "geneva": "geneva==0.15.0",
-    "mcap": "mcap",
-    "mcap_ros2": "mcap-ros2-support",
-    "pyarrow": "pyarrow",
-    "PIL": "pillow",
-    "cv2": "opencv-python",
-    "sklearn": "scikit-learn",
-    "matplotlib": "matplotlib",
-    "seaborn": "seaborn",
-    "tqdm": "tqdm",
-    "mlx_vlm": "mlx-vlm[train]",
-    "psutil": "psutil",
-    "requests": "requests",
+    "mcap": "mcap==1.4.0",
+    "pyarrow": "pyarrow>=20",
+    "PIL": "pillow>=11",
+    "cv2": "opencv-python>=4.10",
+    "sklearn": "scikit-learn>=1.6",
+    "matplotlib": "matplotlib>=3.9",
+    "seaborn": "seaborn>=0.13",
+    "tqdm": "tqdm>=4.67",
+    "psutil": "psutil>=6",
+    "requests": "requests>=2.32",
+    "torch": "torch>=2.4",
+    "torchvision": "torchvision>=0.19",
+    "transformers": "transformers>=5.0,<6",
+    "accelerate": "accelerate>=1.2",
 }
 missing = [dist for module, dist in REQUIRED.items() if importlib.util.find_spec(module) is None]
 if missing:
-    print("Installing missing packages:", ", ".join(missing))
+    print("Installing missing packages into this kernel:", ", ".join(missing))
     subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
 else:
-    print("All required packages are already installed.")
+    print("All required packages are installed in:", sys.executable)
 """
     ),
     code(
         r"""
-import gc, hashlib, io, json, os, platform, random, re, shutil, time, warnings
-from collections import Counter
+import gc, hashlib, io, json, os, platform, random, shutil, tarfile, time, warnings
+from collections import Counter, defaultdict
 from pathlib import Path
+
+ROOT = Path.cwd().resolve()
+DATA = ROOT / "data"
+RAW = DATA / "raw"
+NUIMAGES_ROOT = RAW / "nuimages-mini"
+MCAP_DIR = DATA / "mcap" / "nuimages-mini"
+DB_DIR = DATA / "lancedb-v2"
+ARTIFACTS = ROOT / "artifacts-v2"
+HF_HOME = ROOT / ".cache" / "huggingface"
+TORCH_HOME = ROOT / ".cache" / "torch"
+for p in [RAW, NUIMAGES_ROOT, MCAP_DIR, DB_DIR, ARTIFACTS, HF_HOME, TORCH_HOME]:
+    p.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(HF_HOME))
+os.environ.setdefault("TORCH_HOME", str(TORCH_HOME))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import cv2
 import geneva
@@ -85,474 +107,642 @@ import psutil
 import pyarrow as pa
 import requests
 import seaborn as sns
+import torch
+import torchvision
+import transformers
 from IPython.display import Markdown, display
-from PIL import Image
+from PIL import Image, ImageOps
 from sklearn.metrics import f1_score, precision_recall_fscore_support
+from sklearn.model_selection import GroupShuffleSplit
 from tqdm.auto import tqdm
 
 SEED = 17
-random.seed(SEED); np.random.seed(SEED)
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-ROOT = Path.cwd().resolve()
-DATA = ROOT / "data"
-RAW = DATA / "raw"
-DB_DIR = DATA / "lancedb"
-ARTIFACTS = ROOT / "artifacts"
-HF_HOME = ROOT / ".cache" / "huggingface"
-for p in [RAW, DB_DIR, ARTIFACTS, HF_HOME]: p.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("HF_HOME", str(HF_HOME))
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-MCAP_URL = "https://media.githubusercontent.com/media/foxglove/ros-foxglove-bridge-benchmark-assets/main/nuScenes-v1.0-mini-scene-0061-ros2.mcap"
-MCAP_PATH = RAW / "nuScenes-v1.0-mini-scene-0061-ros2.mcap"
-TABLE_NAME = "nuscenes_front_camera"
-MODEL_ID = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
-IMAGE_SIZE = (504, 280)  # width, height for the trainer compatibility cache
+SOURCE_URL = "https://motional-nuscenes.s3.ap-northeast-1.amazonaws.com/public/nuimages-v1.0/nuimages-v1.0-mini.tgz"
+SOURCE_ARCHIVE = RAW / "nuimages-v1.0-mini.tgz"
+SOURCE_SHA256 = "9f5da97c9a820785487daea1c0f156ae18ddf2ac7e90245fa6d502b400a732b3"
+TABLE_NAME = "nuimages_multicamera"
+MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"
+MODEL_IMAGE_SIZE = (512, 512)
 EPOCHS = 1
+LEARNING_RATE = 1e-5
+VALIDATION_LOSS_EXAMPLES = 12
 
-LABELS = ["bus_present", "multiple_bicycles", "cone_zone", "dense_pedestrians", "barrier_dense", "dense_scene"]
+LABELS = [
+    "pedestrian_present", "car_present", "large_vehicle", "two_wheeler",
+    "traffic_cone", "barrier", "dense_scene",
+]
 QUESTION = (
-    "Tag this front-camera driving scene. Return only a JSON array using zero or more of: "
-    + ", ".join(LABELS)
-    + ". Definitions: multiple_bicycles means at least 2 annotated bicycles; cone_zone at least 20 traffic cones; "
-      "dense_pedestrians at least 30 pedestrians; barrier_dense at least 40 barriers; dense_scene at least 125 annotated objects."
+    "Tag this driving-camera image. Return exactly one JSON array and no other text. "
+    "Use zero or more of: " + ", ".join(LABELS) + ". "
+    "large_vehicle includes trucks, buses, construction vehicles, and trailers; "
+    "two_wheeler includes bicycles and motorcycles; dense_scene means at least 12 annotated objects."
 )
+
+SEMANTIC_COSINE_THRESHOLD = 0.98
+SEMANTIC_DHASH_GUARD = 18
+PERCEPTUAL_HAMMING_THRESHOLD = 5
+
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    MODEL_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    MODEL_DTYPE = torch.bfloat16
+else:
+    DEVICE = torch.device("cpu")
+    MODEL_DTYPE = torch.float32
+
+ALLOW_CPU_FULL_TRAINING = os.environ.get("ALLOW_CPU_FULL_TRAINING") == "1"
 
 sns.set_theme(style="whitegrid", context="notebook")
 plt.rcParams.update({"figure.figsize": (9, 4.5), "axes.titleweight": "bold", "figure.dpi": 120})
 
-def safe_hardware_summary():
-    summary = {"architecture": platform.machine(), "macOS": platform.mac_ver()[0],
-               "memory_GB": round(psutil.virtual_memory().total / 2**30)}
-    try:
-        out = subprocess.check_output(["system_profiler", "SPHardwareDataType"], text=True)
-        for key in ["Model Name", "Chip"]:
-            m = re.search(rf"^\s*{key}:\s*(.+)$", out, re.MULTILINE)
-            if m: summary[key.lower().replace(" ", "_")] = m.group(1)
-    except Exception:
-        pass
-    return summary
+hardware = {
+    "OS": platform.system(), "architecture": platform.machine(),
+    "memory_GB": round(psutil.virtual_memory().total / 2**30),
+    "Python": platform.python_version(), "accelerator": str(DEVICE),
+    "model_dtype": str(MODEL_DTYPE).replace("torch.", ""),
+    "LanceDB": lancedb.__version__, "Feature Engineering": geneva.__version__,
+    "PyTorch": torch.__version__, "Transformers": transformers.__version__,
+}
+display(pd.DataFrame.from_dict(hardware, orient="index", columns=["value"]).rename_axis("environment"))
 
-display(pd.DataFrame({
-    "value": {
-        **safe_hardware_summary(),
-        "python": platform.python_version(), "lancedb": lancedb.__version__,
-        "geneva": geneva.__version__, "model": MODEL_ID, "seed": SEED,
-    }
-}).rename_axis("environment"))
+if DEVICE.type == "cpu" and not ALLOW_CPU_FULL_TRAINING:
+    display(Markdown(
+        "**CPU detected.** Data preparation, curation, and inspection work normally. "
+        "The full-training cells deliberately stop unless `ALLOW_CPU_FULL_TRAINING=1` is set before starting Jupyter. "
+        "For a practical full run, use Apple Silicon Metal or an NVIDIA CUDA GPU."
+    ))
 """
     ),
     md(
         r"""
-## 1. From robotics logs to training rows
+## 1. From public driving data to independent MCAP logs
 
-MCAP is a self-describing, indexed container for timestamped robotics messages. A useful driving log interleaves camera images with calibration, lidar, radar, localization, maps, and annotations—modalities with different rates and large binary payloads. Treating it as a folder of JPEGs loses temporal and structured context.
+MCAP is a log container for timestamped robotics messages. The earlier one-scene version of this demo could not support a credible held-out evaluation, so this version uses the official nuImages mini archive: 50 annotated samples from 44 separate driving logs in Boston and Singapore.
 
-We download Foxglove's public nuScenes ROS 2 fixture, inspect its embedded channel/schema summary, then pair each front-camera frame with the nearest keyframe annotation. The source recording remains immutable; the resulting multimodal rows become the canonical LanceDB table.
+nuImages distributes annotated keyframes plus nearby unannotated sweeps. We normalize each sample into a compact MCAP containing the annotated camera frame and three neighboring frames on either side. The keyframe labels are propagated only within ±1.5 seconds, and every row records that temporal distance. Splits are assigned by complete driving log, never by adjacent frame.
 """
     ),
     code(
         r"""
-def download_with_progress(url: str, destination: Path):
-    if destination.exists() and destination.stat().st_size > 400_000_000:
-        print(f"Cache hit: {destination.name} ({destination.stat().st_size / 2**20:.1f} MiB)")
-        return
-    tmp = destination.with_suffix(destination.suffix + ".part")
-    existing = tmp.stat().st_size if tmp.exists() else 0
-    headers = {"Range": f"bytes={existing}-"} if existing else {}
-    with requests.get(url, stream=True, timeout=60, headers=headers) as response:
+def sha256_file(path: Path, chunk_size: int = 2**20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def download(url: str, path: Path, expected_sha256: str):
+    if path.exists() and sha256_file(path) == expected_sha256:
+        print(f"Cache hit: {path.name}"); return
+    if path.exists():
+        path.unlink()
+    with requests.get(url, stream=True, timeout=60) as response:
         response.raise_for_status()
-        mode = "ab" if existing and response.status_code == 206 else "wb"
-        total = existing + int(response.headers.get("content-length", 0))
-        with open(tmp, mode) as f, tqdm(total=total, initial=existing, unit="B", unit_scale=True, desc="MCAP") as bar:
+        total = int(response.headers.get("content-length", 0))
+        with open(path, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc="Download nuImages mini") as bar:
             for chunk in response.iter_content(2**20):
                 if chunk: f.write(chunk); bar.update(len(chunk))
-    tmp.replace(destination)
+    actual = sha256_file(path)
+    if actual != expected_sha256:
+        raise RuntimeError(f"Source checksum mismatch: expected {expected_sha256}, got {actual}")
 
-download_with_progress(MCAP_URL, MCAP_PATH)
-with open(MCAP_PATH, "rb") as f:
-    digest = hashlib.sha256(f.read()).hexdigest()
-print(f"SHA-256: {digest}\nSize: {MCAP_PATH.stat().st_size / 2**20:.1f} MiB")
+def safe_extract_tgz(archive: Path, destination: Path):
+    marker = destination / "v1.0-mini" / "sample.json"
+    if marker.exists():
+        print("Cache hit: extracted nuImages mini"); return
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            target = (destination / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"Unsafe archive member: {member.name}")
+        tar.extractall(destination)
+
+download(SOURCE_URL, SOURCE_ARCHIVE, SOURCE_SHA256)
+safe_extract_tgz(SOURCE_ARCHIVE, NUIMAGES_ROOT)
+print({"archive_MB": round(SOURCE_ARCHIVE.stat().st_size / 1e6, 1), "sha256": SOURCE_SHA256})
+"""
+    ),
+    code(
+        r"""
+META = NUIMAGES_ROOT / "v1.0-mini"
+load_json = lambda name: json.loads((META / name).read_text())
+samples = load_json("sample.json")
+sample_data = {x["token"]: x for x in load_json("sample_data.json")}
+logs = {x["token"]: x for x in load_json("log.json")}
+categories = {x["token"]: x["name"] for x in load_json("category.json")}
+sensors = {x["token"]: x for x in load_json("sensor.json")}
+calibrated = {x["token"]: x for x in load_json("calibrated_sensor.json")}
+
+objects_by_keyframe = defaultdict(list)
+for ann in load_json("object_ann.json"):
+    objects_by_keyframe[ann["sample_data_token"]].append(categories[ann["category_token"]])
+
+def label_record(category_names):
+    counts = Counter(category_names)
+    object_count = sum(counts.values())
+    flags = {
+        "pedestrian_present": sum(v for k, v in counts.items() if k.startswith("human.pedestrian")) >= 1,
+        "car_present": counts["vehicle.car"] >= 1,
+        "large_vehicle": sum(counts[k] for k in ["vehicle.truck", "vehicle.bus.rigid", "vehicle.construction", "vehicle.trailer"]) >= 1,
+        "two_wheeler": counts["vehicle.bicycle"] + counts["vehicle.motorcycle"] >= 1,
+        "traffic_cone": counts["movable_object.trafficcone"] >= 1,
+        "barrier": counts["movable_object.barrier"] >= 1,
+        "dense_scene": object_count >= 12,
+    }
+    return [x for x in LABELS if flags[x]], object_count, dict(counts)
+
+sample_labels, label_matrix, groups = {}, [], []
+for sample in samples:
+    labels, object_count, category_counts = label_record(objects_by_keyframe[sample["key_camera_token"]])
+    sample_labels[sample["token"]] = {"labels": labels, "object_count": object_count, "category_counts": category_counts}
+    label_matrix.append([int(x in labels) for x in LABELS]); groups.append(sample["log_token"])
+label_matrix, groups = np.asarray(label_matrix), np.asarray(groups)
+
+# Deterministic group-aware split search: all frames from a log remain together.
+indices, overall_rate, best = np.arange(len(samples)), label_matrix.mean(axis=0), None
+for candidate_seed in range(300):
+    trainval, test_idx = next(GroupShuffleSplit(n_splits=1, test_size=.20, random_state=candidate_seed).split(indices, groups=groups))
+    train_rel, val_rel = next(GroupShuffleSplit(n_splits=1, test_size=.25, random_state=candidate_seed + 1000).split(trainval, groups=groups[trainval]))
+    train_idx, val_idx = trainval[train_rel], trainval[val_rel]
+    parts = [train_idx, val_idx, test_idx]
+    missing = sum(np.any(label_matrix[p].sum(axis=0) == 0) for p in parts)
+    score = missing * 100 + sum(np.abs(label_matrix[p].mean(axis=0) - overall_rate).mean() for p in parts)
+    if best is None or score < best[0]: best = (score, candidate_seed, *parts)
+
+_, split_seed, train_idx, val_idx, test_idx = best
+sample_split = {}
+for split, part in [("train", train_idx), ("validation", val_idx), ("test", test_idx)]:
+    sample_split.update({samples[i]["token"]: split for i in part})
+
+split_summary = []
+for split in ["train", "validation", "test"]:
+    chosen = [i for i, s in enumerate(samples) if sample_split[s["token"]] == split]
+    split_summary.append({"split": split, "annotated_samples": len(chosen), "independent_logs": len(set(groups[chosen])),
+                          **{label: int(label_matrix[chosen, j].sum()) for j, label in enumerate(LABELS)}})
+display(pd.DataFrame(split_summary))
+print(f"Selected deterministic group-stratification seed: {split_seed}")
+"""
+    ),
+    code(
+        r"""
+from mcap.writer import Writer
+
+ANNOTATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sample_id": {"type": "string"}, "log_id": {"type": "string"},
+        "split": {"type": "string"}, "camera_channel": {"type": "string"},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "object_count": {"type": "integer"}, "category_counts": {"type": "object"},
+    },
+}
+
+def sample_chain(sample):
+    key = sample_data[sample["key_camera_token"]]
+    current = key
+    while current["prev"]:
+        current = sample_data[current["prev"]]
+    chain = []
+    while current:
+        if abs(current["timestamp"] - sample["timestamp"]) <= 1_500_000:
+            chain.append(current)
+        current = sample_data[current["next"]] if current["next"] else None
+    return chain
+
+conversion_spec = {
+    "source_sha256": SOURCE_SHA256, "window_us": 1_500_000,
+    "split_seed": split_seed, "labels": LABELS,
+}
+conversion_fingerprint = hashlib.sha256(json.dumps(conversion_spec, sort_keys=True).encode()).hexdigest()
+conversion_manifest = MCAP_DIR / "manifest.json"
+
+cache_ok = False
+if conversion_manifest.exists():
+    old = json.loads(conversion_manifest.read_text())
+    cache_ok = old.get("fingerprint") == conversion_fingerprint and len(list(MCAP_DIR.glob("*.mcap"))) == len(samples)
+
+if cache_ok:
+    print(f"Cache hit: {len(samples)} compact MCAP logs")
+else:
+    for old_mcap in MCAP_DIR.glob("*.mcap"):
+        old_mcap.unlink()
+    for sample in tqdm(samples, desc="Write compact MCAP logs"):
+        key = sample_data[sample["key_camera_token"]]
+        sensor = sensors[calibrated[key["calibrated_sensor_token"]]["sensor_token"]]
+        channel_name = sensor["channel"]
+        label_info = sample_labels[sample["token"]]
+        payload = {
+            "sample_id": sample["token"], "log_id": sample["log_token"],
+            "split": sample_split[sample["token"]], "camera_channel": channel_name,
+            **label_info,
+        }
+        path = MCAP_DIR / f"nuimages-mini-{sample['token'][:12]}.mcap"
+        with open(path, "wb") as f:
+            writer = Writer(f)
+            writer.start(profile="nuimages-mini", library="lancedb-mcap-demo")
+            annotation_schema_id = writer.register_schema("driving_scene_labels", "jsonschema", json.dumps(ANNOTATION_SCHEMA).encode())
+            image_channel = writer.register_channel(f"/camera/{channel_name}/image_jpeg", "jpeg", 0,
+                                                    {"camera_channel": channel_name})
+            annotation_channel = writer.register_channel("/annotations/scene_labels", "json", annotation_schema_id)
+            writer.add_metadata("source", {"dataset": "nuImages mini", "sample_id": sample["token"],
+                                            "log_id": sample["log_token"], "location": logs[sample["log_token"]]["location"]})
+            writer.add_message(annotation_channel, sample["timestamp"] * 1000, json.dumps(payload, sort_keys=True).encode(), sample["timestamp"] * 1000)
+            for sequence, frame in enumerate(sample_chain(sample)):
+                image_bytes = (NUIMAGES_ROOT / frame["filename"]).read_bytes()
+                writer.add_message(image_channel, frame["timestamp"] * 1000, image_bytes, frame["timestamp"] * 1000, sequence=sequence)
+            writer.finish()
+    conversion_manifest.write_text(json.dumps({"fingerprint": conversion_fingerprint, "files": len(samples)}, indent=2))
+
+print({"MCAP_files": len(list(MCAP_DIR.glob('*.mcap'))),
+       "total_MB": round(sum(p.stat().st_size for p in MCAP_DIR.glob('*.mcap')) / 1e6, 1)})
+"""
+    ),
+    md(
+        r"""
+## 2. One multimodal Lance table
+
+Lance is the open-source columnar format underneath this workflow. It keeps large image blobs beside typed metadata while supporting scans, random row access, and versioned updates. LanceDB OSS is the in-process database and query layer: filters and vector search operate over the same table.
+
+The compact MCAP collection is now the immutable robotics-log input. We inspect its channels, pair every image with the keyframe annotation in that MCAP, and write the images, provenance, split, and targets into one Lance table. Labels on sweep frames are intentionally marked as propagated and include `label_age_ms`.
 """
     ),
     code(
         r"""
 from mcap.reader import make_reader
 
-with open(MCAP_PATH, "rb") as f:
-    reader = make_reader(f)
-    summary = reader.get_summary()
-    stats = summary.statistics
-    topic_rows = []
-    for channel_id, channel in summary.channels.items():
-        schema = summary.schemas.get(channel.schema_id)
-        topic_rows.append({
-            "topic": channel.topic,
-            "messages": stats.channel_message_counts.get(channel_id, 0),
-            "encoding": channel.message_encoding,
-            "schema": schema.name if schema else "",
-        })
-
-topic_summary = pd.DataFrame(topic_rows).sort_values(["topic"]).reset_index(drop=True)
-display(Markdown(
-    f"**{stats.message_count:,} messages**, **{len(topic_summary)} topics**, "
-    f"**{(stats.message_end_time - stats.message_start_time) / 1e9:.1f} seconds**"
-))
-display(topic_summary)
-"""
-    ),
-    code(
-        r"""
-from mcap_ros2.decoder import DecoderFactory
-
-# Official nuScenes RGB category map. The ROS 2 fixture stores category identity in marker color.
-COLOR_TO_CATEGORY = {
-    (0, 0, 230): "pedestrian", (112, 128, 144): "barrier", (255, 158, 0): "car",
-    (47, 79, 79): "traffic_cone", (255, 99, 71): "truck", (220, 20, 60): "bicycle",
-    (255, 69, 0): "bus", (233, 150, 70): "construction_vehicle",
-    (105, 105, 105): "pushable_object",
-}
-
-def categories_from_markers(markers):
-    counts = Counter()
-    for marker in markers:
-        rgb = tuple(round(v * 255) for v in (marker.color.r, marker.color.g, marker.color.b))
-        counts[COLOR_TO_CATEGORY.get(rgb, "other")] += 1
-    return counts
-
-def concepts(counts: Counter) -> list[str]:
-    object_count = sum(counts.values())
-    flags = {
-        "bus_present": counts["bus"] >= 1,
-        "multiple_bicycles": counts["bicycle"] >= 2,
-        "cone_zone": counts["traffic_cone"] >= 20,
-        "dense_pedestrians": counts["pedestrian"] >= 30,
-        "barrier_dense": counts["barrier"] >= 40,
-        "dense_scene": object_count >= 125,
-    }
-    return [name for name in LABELS if flags[name]]
-
-def assign_sequence(t: float):
-    # 1.5 s of usable data followed by a 0.5 s guard band.
-    block, phase = int(t // 2.0), t % 2.0
-    if block > 9 or phase > 1.5: return None, "guard"
-    split = "train" if block in {0, 2, 4, 5, 6, 9} else "validation" if block == 3 else "test"
-    return f"seq_{block:02d}", split
-
-def parse_front_camera(path: Path):
-    image_topic = "/CAM_FRONT/image_rect_compressed"
-    annotation_topic = "/markers/annotations"
-    images, annotations = [], []
-    with open(path, "rb") as f:
-        reader = make_reader(f, decoder_factories=[DecoderFactory()])
-        for _, channel, message, decoded in tqdm(
-            reader.iter_decoded_messages(topics=[image_topic, annotation_topic]), desc="Decode MCAP"
-        ):
-            if channel.topic == image_topic:
-                images.append((message.log_time, bytes(decoded.data), decoded.format))
-            else:
-                annotations.append((message.log_time, categories_from_markers(decoded.markers)))
-    ann_times = np.array([t for t, _ in annotations], dtype=np.int64)
-    origin = min(images[0][0], annotations[0][0])
-    rows = []
-    for timestamp_ns, payload, image_format in images:
-        pos = int(np.searchsorted(ann_times, timestamp_ns))
-        candidates = [i for i in (pos - 1, pos) if 0 <= i < len(annotations)]
-        nearest = min(candidates, key=lambda i: abs(int(ann_times[i]) - timestamp_ns))
-        delta_ms = abs(int(ann_times[nearest]) - timestamp_ns) / 1e6
-        counts = annotations[nearest][1]
-        t = (timestamp_ns - origin) / 1e9
-        sequence_id, split = assign_sequence(t)
-        if sequence_id is None: continue
-        with Image.open(io.BytesIO(payload)) as im: width, height = im.size
-        labels = concepts(counts)
+topic_counts, schema_counts, rows = Counter(), Counter(), []
+for mcap_path in tqdm(sorted(MCAP_DIR.glob("*.mcap")), desc="Read MCAP logs"):
+    images, annotation = [], None
+    with open(mcap_path, "rb") as f:
+        reader = make_reader(f)
+        for schema, channel, message in reader.iter_messages():
+            topic_counts[channel.topic] += 1
+            schema_counts[(schema.name if schema else "schema-less", channel.message_encoding)] += 1
+            if channel.message_encoding == "jpeg":
+                images.append((message.log_time, bytes(message.data)))
+            elif channel.topic == "/annotations/scene_labels":
+                annotation = (message.log_time, json.loads(message.data))
+    if annotation is None:
+        raise RuntimeError(f"Missing annotation message in {mcap_path.name}")
+    annotation_time, info = annotation
+    for timestamp_ns, image_bytes in images:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
         rows.append({
-            "frame_id": f"scene-0061-{timestamp_ns}", "scene_id": "scene-0061",
-            "sequence_id": sequence_id, "split": split, "timestamp_ns": timestamp_ns,
-            "time_s": t, "image": payload, "image_format": image_format,
-            "width": width, "height": height, "annotation_delta_ms": delta_ms,
-            "pedestrian_count": counts["pedestrian"], "bicycle_count": counts["bicycle"],
-            "bus_count": counts["bus"], "truck_count": counts["truck"],
-            "traffic_cone_count": counts["traffic_cone"], "barrier_count": counts["barrier"],
-            "construction_vehicle_count": counts["construction_vehicle"],
-            "object_count_gt": sum(counts.values()), "labels": labels,
-            "label_text": json.dumps(labels, separators=(",", ":")), "source_uri": MCAP_URL,
+            "frame_id": f"{info['sample_id']}-{timestamp_ns}",
+            "sample_id": info["sample_id"], "log_id": info["log_id"],
+            "location": logs[info["log_id"]]["location"], "camera_channel": info["camera_channel"],
+            "split": info["split"], "timestamp_ns": timestamp_ns,
+            "time_offset_s": (timestamp_ns - annotation_time) / 1e9,
+            "is_key_frame": timestamp_ns == annotation_time,
+            "label_age_ms": abs(timestamp_ns - annotation_time) / 1e6,
+            "image": image_bytes, "image_format": "jpeg", "width": width, "height": height,
+            "object_count_gt": info["object_count"], "labels": info["labels"],
+            "label_text": json.dumps(info["labels"], separators=(",", ":")),
+            "source_mcap": mcap_path.name, "source_uri": SOURCE_URL,
         })
-    return rows
 
-rows = parse_front_camera(MCAP_PATH)
-print(f"Prepared {len(rows)} front-camera rows across {len(set(r['sequence_id'] for r in rows))} guarded sequences.")
-"""
-    ),
-    md(
-        r"""
-## 2. One multimodal table
-
-**Lance** is the open-source columnar table format underneath this workflow. It is designed for AI and multimodal data: efficient random access to individual rows and large binary values, scan efficiency for structured columns, and table versioning coexist in one dataset.
-
-**LanceDB OSS** is the local, in-process database and query layer over Lance. It provides filters and vector search over the same table—no service is required here. We store compressed image bytes beside timestamps, sequence assignments, counts, and multilabel targets instead of making the filesystem the source of truth.
+display(pd.DataFrame(topic_counts.most_common(10), columns=["topic", "messages"]))
+display(pd.DataFrame([(a, b, n) for (a, b), n in schema_counts.items()], columns=["schema", "encoding", "messages"]))
+print(f"Prepared {len(rows)} frames from {len(set(r['sample_id'] for r in rows))} samples and {len(set(r['log_id'] for r in rows))} independent logs.")
 """
     ),
     code(
         r"""
 schema = pa.schema([
-    pa.field("frame_id", pa.string()), pa.field("scene_id", pa.string()),
-    pa.field("sequence_id", pa.string()), pa.field("split", pa.string()),
-    pa.field("timestamp_ns", pa.int64()), pa.field("time_s", pa.float64()),
+    pa.field("frame_id", pa.string()), pa.field("sample_id", pa.string()), pa.field("log_id", pa.string()),
+    pa.field("location", pa.string()), pa.field("camera_channel", pa.string()), pa.field("split", pa.string()),
+    pa.field("timestamp_ns", pa.int64()), pa.field("time_offset_s", pa.float64()),
+    pa.field("is_key_frame", pa.bool_()), pa.field("label_age_ms", pa.float64()),
     pa.field("image", pa.large_binary()), pa.field("image_format", pa.string()),
     pa.field("width", pa.int32()), pa.field("height", pa.int32()),
-    pa.field("annotation_delta_ms", pa.float64()), pa.field("pedestrian_count", pa.int64()),
-    pa.field("bicycle_count", pa.int64()), pa.field("bus_count", pa.int64()),
-    pa.field("truck_count", pa.int64()), pa.field("traffic_cone_count", pa.int64()),
-    pa.field("barrier_count", pa.int64()), pa.field("construction_vehicle_count", pa.int64()),
     pa.field("object_count_gt", pa.int64()), pa.field("labels", pa.list_(pa.string())),
-    pa.field("label_text", pa.string()), pa.field("source_uri", pa.string()),
+    pa.field("label_text", pa.string()), pa.field("source_mcap", pa.string()), pa.field("source_uri", pa.string()),
 ])
 
 db = geneva.connect(DB_DIR)
 table = db.create_table(TABLE_NAME, pa.Table.from_pylist(rows, schema=schema), mode="overwrite")
 print(table.schema)
-print(f"Lance table version after ingest: {table.version}")
+print(f"Rows: {table.count_rows()} · Lance version: {table.version}")
 
-# This is an actual structured LanceDB query; only the image bytes are omitted from display.
-preview = (table.search().where("split = 'train'").select([
-    "frame_id", "sequence_id", "time_s", "labels", "object_count_gt"
-]).limit(6).to_arrow().to_pandas())
+preview = (table.search().where("is_key_frame = true").select([
+    "frame_id", "log_id", "location", "camera_channel", "split", "labels", "object_count_gt"
+]).limit(8).to_arrow().to_pandas())
 display(preview)
 """
     ),
     code(
         r"""
-def show_rows(records, title, ncols=3):
+def show_rows(records, title):
     records = list(records)
-    fig, axes = plt.subplots(1, len(records), figsize=(5 * len(records), 3.4))
-    axes = np.atleast_1d(axes)
-    for ax, row in zip(axes, records):
+    ncols, nrows = 3, int(np.ceil(len(records) / 3))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(13, 3.5 * nrows))
+    for ax, row in zip(np.asarray(axes).reshape(-1), records):
         ax.imshow(Image.open(io.BytesIO(row["image"])))
-        ax.set_title(f"t={row['time_s']:.1f}s · {row['sequence_id']}\n" + ", ".join(row["labels"]), fontsize=9)
+        ax.set_title(f"{row['camera_channel']} · {row['location']}\n" + ", ".join(row["labels"]), fontsize=8)
         ax.axis("off")
-    fig.suptitle(title, fontweight="bold"); plt.tight_layout(); plt.show()
+    for ax in np.asarray(axes).reshape(-1)[len(records):]: ax.axis("off")
+    plt.suptitle(title, fontweight="bold"); plt.tight_layout(); plt.show()
 
-sample_rows = table.search().select(["image", "time_s", "sequence_id", "labels"]).limit(3).to_arrow().to_pylist()
-show_rows(sample_rows, "Front-camera frames and annotation-derived concepts")
+keyframes = table.search().where("is_key_frame = true").select([
+    "image", "camera_channel", "location", "labels"
+]).to_arrow().to_pylist()
+sample_rows = []
+for index, camera in enumerate(sorted(set(r["camera_channel"] for r in keyframes))):
+    candidates = [r for r in keyframes if r["camera_channel"] == camera]
+    preferred_city = "boston-seaport" if index % 2 == 0 else "singapore-onenorth"
+    sample_rows.append(next((r for r in candidates if r["location"] == preferred_city), candidates[0]))
+show_rows(sample_rows, "Independent annotated samples across camera positions and cities")
 """
     ),
     md(
         r"""
-## 3. Compute features on the table
+## 3. Compute model-ready and semantic columns on the data
 
-**LanceDB Feature Engineering, currently available through the `geneva` Python package**, lets us declare derived columns as versioned UDFs and backfill them into the existing Lance table. The architectural point is that blur, brightness, and perceptual representations become governed table columns—not the output of an unrelated ETL job and another manifest to reconcile.
+LanceDB Feature Engineering, currently available through the `geneva` Python package, lets us declare versioned transforms and backfill their results into the table. We store both the source JPEG and a deterministic 512×512 letterboxed JPEG column. Keeping the model representation in Lance costs additional table storage, but removes the loose-file export and makes preprocessing versioned and queryable.
 
-The installed `geneva` API was inspected before authoring this notebook: `@geneva.udf`, `Table.add_columns`, and synchronous `Table.backfill` are supported in version 0.15.0. Its cross-row UDTF API is still beta, so later global rarity and greedy dedup decisions use a small deterministic LanceDB merge fallback; that boundary is explicit.
+Brightness, blur, dHash, and an ImageNet-trained ResNet-18 embedding are also table columns. dHash captures almost-identical pixels; the normalized 512-dimensional representation adds semantic structure. The ResNet model is an intentionally modest feature extractor—not a claim that ImageNet semantics perfectly represent driving scenes.
 """
     ),
     code(
         r"""
-@geneva.udf(data_type=pa.float32(), version="brightness-v1")
-def brightness(image: bytes) -> float:
+@geneva.udf(data_type=pa.large_binary(), version="model-jpeg-letterbox-512-v1")
+def model_image(image: bytes) -> bytes:
+    from PIL import Image, ImageOps
+    import io
+    with Image.open(io.BytesIO(image)) as im:
+        prepared = ImageOps.pad(im.convert("RGB"), (512, 512), method=Image.Resampling.LANCZOS, color=(0, 0, 0))
+        out = io.BytesIO(); prepared.save(out, format="JPEG", quality=92)
+        return out.getvalue()
+
+@geneva.udf(data_type=pa.float32(), version="brightness-v2")
+def brightness(model_image: bytes) -> float:
     import cv2, numpy as np
-    arr = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_GRAYSCALE)
+    arr = cv2.imdecode(np.frombuffer(model_image, np.uint8), cv2.IMREAD_GRAYSCALE)
     if arr is None: raise ValueError("JPEG decode failed")
     return float(arr.mean())
 
-@geneva.udf(data_type=pa.float32(), version="blur-score-v1")
-def blur_score(image: bytes) -> float:
+@geneva.udf(data_type=pa.float32(), version="blur-score-v2")
+def blur_score(model_image: bytes) -> float:
     import cv2, numpy as np
-    arr = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_GRAYSCALE)
+    arr = cv2.imdecode(np.frombuffer(model_image, np.uint8), cv2.IMREAD_GRAYSCALE)
     if arr is None: raise ValueError("JPEG decode failed")
     return float(cv2.Laplacian(arr, cv2.CV_64F).var())
 
-@geneva.udf(data_type=pa.list_(pa.float32(), 64), version="dhash64-v1")
-def dhash_embedding(image: bytes) -> list[float]:
+@geneva.udf(data_type=pa.list_(pa.float32(), 64), version="dhash64-v2")
+def dhash_embedding(model_image: bytes) -> list[float]:
     import cv2, numpy as np
-    arr = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_GRAYSCALE)
+    arr = cv2.imdecode(np.frombuffer(model_image, np.uint8), cv2.IMREAD_GRAYSCALE)
     if arr is None: raise ValueError("JPEG decode failed")
     small = cv2.resize(arr, (9, 8), interpolation=cv2.INTER_AREA)
     return (small[:, 1:] > small[:, :-1]).astype(np.float32).reshape(-1).tolist()
 
-feature_udfs = {"brightness": brightness, "blur_score": blur_score, "dhash_embedding": dhash_embedding}
-for name, fn in feature_udfs.items():
-    if name not in table.schema.names:
-        table.add_columns({name: fn})
+_SEMANTIC_RUNTIME = {}
+@geneva.udf(data_type=pa.list_(pa.float32(), 512), version="resnet18-semantic-v1", num_cpus=1)
+def semantic_embedding(model_image: bytes) -> list[float]:
+    import io, torch
+    from PIL import Image
+    from torchvision.models import resnet18, ResNet18_Weights
+    global _SEMANTIC_RUNTIME
+    if not _SEMANTIC_RUNTIME:
+        torch.set_num_threads(1)
+        weights = ResNet18_Weights.DEFAULT
+        network = resnet18(weights=weights)
+        network.fc = torch.nn.Identity(); network.eval()
+        _SEMANTIC_RUNTIME = {"model": network, "transform": weights.transforms()}
+    with Image.open(io.BytesIO(model_image)) as im, torch.inference_mode():
+        vector = _SEMANTIC_RUNTIME["model"](_SEMANTIC_RUNTIME["transform"](im.convert("RGB")).unsqueeze(0))[0]
+        vector = torch.nn.functional.normalize(vector, dim=0)
+    return vector.cpu().float().tolist()
 
+# Prewarm the small public weight file once; Feature Engineering workers reuse TORCH_HOME.
+from torchvision.models import ResNet18_Weights
+ResNet18_Weights.DEFAULT.get_state_dict(progress=True)
+
+feature_udfs = [
+    ("model_image", model_image), ("brightness", brightness), ("blur_score", blur_score),
+    ("dhash_embedding", dhash_embedding), ("semantic_embedding", semantic_embedding),
+]
 feature_backend = "LanceDB Feature Engineering UDF backfill"
 try:
-    for name in feature_udfs:
-        nulls = table.search().where(f"{name} IS NULL").limit(1).to_arrow().num_rows
-        if nulls:
-            print(f"Backfilling {name} …")
-            table.backfill(name, concurrency=2, checkpoint_size=32, _admission_check=False, refresh_status_secs=60)
+    with db.local_ray_context():
+        for name, fn in feature_udfs:
+            if name not in table.schema.names:
+                table.add_columns({name: fn})
+            if table.search().where(f"{name} IS NULL").limit(1).to_arrow().num_rows:
+                print(f"Backfilling {name} …")
+                table.backfill(name, concurrency=1, checkpoint_size=32, _admission_check=False)
 except Exception as exc:
-    # Smallest local fallback for environments where Ray workers cannot start (common in sandboxed kernels).
-    feature_backend = f"in-process fallback ({type(exc).__name__}: {str(exc).splitlines()[0]})"
-    print("Backfill unavailable; using the documented in-process fallback.")
+    feature_backend = f"same UDFs, in-process executor fallback ({type(exc).__name__})"
+    warnings.warn(f"Feature Engineering worker executor unavailable; executing the declared UDFs locally: {exc}")
     current = table.to_arrow().to_pylist()
-    def local_features(payload):
-        arr = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
-        small = cv2.resize(arr, (9, 8), interpolation=cv2.INTER_AREA)
-        return float(arr.mean()), float(cv2.Laplacian(arr, cv2.CV_64F).var()), (small[:,1:] > small[:,:-1]).astype(np.float32).reshape(-1).tolist()
-    for name in feature_udfs:
-        if name in table.schema.names: table.drop_columns([name])
-    table.add_columns({"brightness": "cast(null as float)", "blur_score": "cast(null as float)",
-                       "dhash_embedding": "cast(null as fixed_size_list(float, 64))"})
-    updates = []
-    for row in tqdm(current, desc="Local feature fallback"):
-        b, q, h = local_features(row["image"])
-        updates.append({"frame_id": row["frame_id"], "brightness": b, "blur_score": q, "dhash_embedding": h})
-    table.merge_insert("frame_id").when_matched_update_all().execute(pa.Table.from_pylist(updates))
+    for name, fn in feature_udfs:
+        if name in table.schema.names:
+            table.drop_columns([name])
+        sql_type = dict(model_image="large_binary", brightness="float", blur_score="float",
+                        dhash_embedding="fixed_size_list(float, 64)",
+                        semantic_embedding="fixed_size_list(float, 512)")[name]
+        table.add_columns({name: f"cast(null as {sql_type})"})
+        updates = [{"frame_id": row["frame_id"], name: fn.func(row["model_image"] if name != "model_image" else row["image"])} for row in tqdm(current, desc=name)]
+        table.merge_insert("frame_id").when_matched_update_all().execute(pa.Table.from_pylist(updates))
+        current = table.to_arrow().to_pylist()
 
 print("Feature backend:", feature_backend)
-print(f"Lance table version after feature computation: {table.version}")
-display(table.search().select(["frame_id", "brightness", "blur_score", "dhash_embedding"]).limit(4).to_arrow().to_pandas())
-"""
-    ),
-    code(
-        r"""
-# Exact search is sufficient for 170 rows; the same query API uses an ANN index at larger scale.
-try:
-    table.create_index(metric="L2", vector_column_name="dhash_embedding", index_type="IVF_FLAT",
-                       num_partitions=2, replace=True)
-    print("Created a small IVF_FLAT index on dhash_embedding.")
-except Exception as exc:
-    print("Exact vector scan retained for this small table:", type(exc).__name__)
+print(f"Lance version after features: {table.version}")
+display(table.search().select(["frame_id", "brightness", "blur_score", "semantic_embedding"]).limit(3).to_arrow().to_pandas())
 """
     ),
     md(
         r"""
-## 4. See the redundancy
+## 4. See both pixel and semantic redundancy
 
-Dashcam video is dominated by adjacent frames that are nearly identical. Training on all of them spends compute repeating the same road geometry and overweights a few seconds of one route. The 64-bit dHash column is a perceptual vector: LanceDB can retrieve similar images while structured predicates keep the search inside the training split.
+Adjacent camera frames can be redundant in two different senses. A low dHash Hamming distance finds nearly unchanged pixels. A high semantic cosine similarity finds frames whose learned visual content is almost equivalent even when exposure, crop, or small object motion changes.
 
-We quantify nearest-neighbor redundancy and inspect deterministic query anchors. This is perceptual deduplication, not semantic deletion: later curation preserves label transitions and rare concept combinations even when pixels remain similar.
+For removal, the semantic rule is deliberately conservative: cosine similarity must be at least **0.98**, the dHash distance must also be at most **18**, the labels must match, and comparison stays inside one short sample sequence. This threshold is calibrated from the observed training-distance tail; semantic similarity alone never deletes a row.
 """
     ),
     code(
         r"""
-train_rows = table.search().where("split = 'train'").select([
-    "frame_id", "sequence_id", "time_s", "image", "labels", "dhash_embedding", "brightness", "blur_score"
-]).to_arrow().to_pylist()
+for vector_column, partitions in [("dhash_embedding", 4), ("semantic_embedding", 8)]:
+    try:
+        table.create_index(metric="L2" if vector_column == "dhash_embedding" else "cosine",
+                           vector_column_name=vector_column, index_type="IVF_FLAT",
+                           num_partitions=partitions, replace=True)
+        print("Indexed", vector_column)
+    except Exception as exc:
+        print(f"Exact scan retained for {vector_column}: {type(exc).__name__}")
 
-def hamming(a, b): return int(np.abs(np.asarray(a) - np.asarray(b)).sum())
+train_anchors = (table.search().where("split = 'train' AND is_key_frame = true").select([
+    "frame_id", "sample_id", "image", "labels", "dhash_embedding", "semantic_embedding", "camera_channel"
+]).limit(3).to_arrow().to_pylist())
 
-nearest = {}
-for row in tqdm(train_rows, desc="Nearest-neighbor queries"):
-    candidates = (table.search(row["dhash_embedding"], vector_column_name="dhash_embedding")
-                  .metric("L2").where(f"split = 'train' AND frame_id != '{row['frame_id']}'", prefilter=True)
-                  .select(["frame_id", "image", "time_s", "sequence_id", "labels", "dhash_embedding", "_distance"])
-                  .limit(1).to_arrow().to_pylist())
-    if candidates:
-        nn = candidates[0]; nearest[row["frame_id"]] = (nn["frame_id"], hamming(row["dhash_embedding"], nn["dhash_embedding"]))
-
-near_duplicate_rate = np.mean([distance <= 8 for _, distance in nearest.values()])
-display(pd.DataFrame({
-    "measure": ["all usable frames", "raw train frames", "near-duplicate train frames (Hamming ≤ 8)", "near-duplicate rate"],
-    "value": [table.count_rows(), len(train_rows), sum(d <= 8 for _, d in nearest.values()), f"{near_duplicate_rate:.1%}"],
-}))
+fig, axes = plt.subplots(len(train_anchors), 3, figsize=(13, 3.4 * len(train_anchors)))
+for i, anchor in enumerate(train_anchors):
+    perceptual = (table.search(anchor["dhash_embedding"], vector_column_name="dhash_embedding")
+                  .metric("L2").bypass_vector_index().where(
+                      f"split = 'train' AND sample_id = '{anchor['sample_id']}' AND frame_id != '{anchor['frame_id']}'", prefilter=True)
+                  .select(["image", "frame_id", "semantic_embedding", "_distance"]).limit(1).to_arrow().to_pylist()[0])
+    semantic = (table.search(anchor["semantic_embedding"], vector_column_name="semantic_embedding")
+                .metric("cosine").bypass_vector_index().where(
+                    f"split = 'train' AND sample_id = '{anchor['sample_id']}' AND frame_id != '{anchor['frame_id']}'", prefilter=True)
+                .select(["image", "frame_id", "dhash_embedding", "_distance"]).limit(1).to_arrow().to_pylist()[0])
+    items = [(anchor, "query"), (perceptual, f"pixel neighbor · L2={perceptual['_distance']:.1f}"),
+             (semantic, f"semantic neighbor · cosine={1-semantic['_distance']:.4f}")]
+    for j, (row, title) in enumerate(items):
+        axes[i, j].imshow(Image.open(io.BytesIO(row["image"]))); axes[i, j].set_title(title); axes[i, j].axis("off")
+plt.suptitle("Exact LanceDB nearest-neighbor queries inside each sequence", fontweight="bold")
+plt.tight_layout(); plt.show()
 """
     ),
     code(
         r"""
-by_id = {r["frame_id"]: r for r in train_rows}
-anchors = sorted(train_rows, key=lambda r: r["time_s"])[::max(1, len(train_rows)//3)][:3]
-fig, axes = plt.subplots(len(anchors), 2, figsize=(10, 3.3 * len(anchors)))
-for i, anchor in enumerate(anchors):
-    neighbor_id, distance = nearest[anchor["frame_id"]]
-    neighbor = by_id[neighbor_id]
-    for j, (row, label) in enumerate([(anchor, "query"), (neighbor, f"nearest · Hamming={distance}")]):
-        axes[i, j].imshow(Image.open(io.BytesIO(row["image"])))
-        axes[i, j].set_title(f"{label} · t={row['time_s']:.2f}s · {row['sequence_id']}")
-        axes[i, j].axis("off")
-plt.suptitle("LanceDB perceptual-vector neighbors", fontweight="bold"); plt.tight_layout(); plt.show()
-"""
-    ),
-    code(
-        r"""
-eda = table.search().select(["split", "sequence_id", "labels"]).to_arrow().to_pylist()
+eda = table.search().select(["split", "log_id", "sample_id", "labels", "camera_channel"]).to_arrow().to_pylist()
 dist_rows = []
 for split in ["train", "validation", "test"]:
     group = [r for r in eda if r["split"] == split]
     for label in LABELS:
-        dist_rows.append({"split": split, "label": label, "positive_rate": np.mean([label in r["labels"] for r in group]), "frames": len(group)})
+        dist_rows.append({"split": split, "label": label,
+                          "positive_rate": np.mean([label in r["labels"] for r in group]),
+                          "frames": len(group), "logs": len(set(r["log_id"] for r in group))})
 dist_df = pd.DataFrame(dist_rows)
 display(dist_df.pivot(index="label", columns="split", values="positive_rate").style.format("{:.0%}"))
 sns.barplot(data=dist_df, x="label", y="positive_rate", hue="split")
-plt.xticks(rotation=30, ha="right"); plt.ylabel("positive frame rate"); plt.title("Concept distribution before curation"); plt.tight_layout(); plt.show()
+plt.xticks(rotation=28, ha="right"); plt.ylabel("positive frame rate"); plt.title("Label distribution across independent-log splits")
+plt.tight_layout(); plt.show()
 """
     ),
     md(
         r"""
-## 5. Curate with auditable decisions
+## 5. Curate with a cross-row UDTF
 
-The curated set combines three controls: a low-tail blur/visibility filter, greedy within-sequence perceptual deduplication, and a cap on repeated label signatures. Rare signatures and label transitions receive explicit protection. This avoids the common mistake of removing every visually similar hard example.
+This is the operation that should not be expressed as a row UDF: rarity, balancing, and deduplication depend on other rows. A beta LanceDB Feature Engineering UDTF reads the training query, performs the deterministic cross-row decision, and materializes an auditable decision table. The resulting columns are then merged back into the source table.
 
-Every decision is written back to the same Lance table as queryable columns: eligibility, nearest retained frame, Hamming distance, rarity score, retain flag, and reason. `raw_train` and `curated_train` are therefore deterministic filters over one versioned source rather than disconnected folders.
+The local UDTF executor uses Ray. If a restricted environment prevents Ray from starting, the notebook invokes the **same declared UDTF** in-process and clearly records the executor fallback; it does not maintain a second curation algorithm.
 """
     ),
     code(
         r"""
-train_rows = sorted(train_rows, key=lambda r: (r["sequence_id"], r["time_s"]))
-prevalence = {label: np.mean([label in r["labels"] for r in train_rows]) for label in LABELS}
-for r in train_rows:
-    positive = [label for label in LABELS if label in r["labels"]]
-    negative = [label for label in LABELS if label not in r["labels"]]
-    r["rarity_score"] = float(np.mean([1 / np.sqrt(max(prevalence[x], 1e-6)) for x in positive] +
-                                      [0.35 / np.sqrt(max(1-prevalence[x], 1e-6)) for x in negative]))
+CURATION_SCHEMA = pa.schema([
+    pa.field("frame_id", pa.string()), pa.field("quality_pass", pa.bool_()),
+    pa.field("rarity_score", pa.float32()), pa.field("nearest_hamming", pa.int32()),
+    pa.field("nearest_semantic_cosine", pa.float32()), pa.field("duplicate_of", pa.string()),
+    pa.field("duplicate_method", pa.string()), pa.field("retained_curated", pa.bool_()),
+    pa.field("curation_reason", pa.string()), pa.field("training_eligible", pa.bool_()),
+])
 
-blur_floor = max(20.0, float(np.quantile([r["blur_score"] for r in train_rows], 0.05)))
-rare_cut = float(np.quantile([r["rarity_score"] for r in train_rows], 0.80))
-decisions, last_kept = {}, {}
-signature_counts = Counter()
+def hamming(a, b):
+    return int(np.abs(np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)).sum())
 
-for r in train_rows:
-    quality = 30 <= r["brightness"] <= 230 and r["blur_score"] >= blur_floor
-    signature = tuple(r["labels"])
-    prior = last_kept.get(r["sequence_id"])
-    distance = hamming(r["dhash_embedding"], prior["dhash_embedding"]) if prior else 64
-    same_signature = prior is not None and tuple(prior["labels"]) == signature
-    rare = r["rarity_score"] >= rare_cut
-    duplicate = prior is not None and distance <= 8 and same_signature and (r["time_s"] - prior["time_s"] < 0.45)
-    if not quality:
-        keep, reason = False, "filtered_low_quality"
-    elif duplicate and not rare:
-        keep, reason = False, "dropped_near_duplicate"
-    elif signature_counts[signature] >= 8 and not rare:
-        keep, reason = False, "dropped_balance_cap"
-    else:
-        keep, reason = True, "retained_rare" if rare else "retained_balanced"
-        last_kept[r["sequence_id"]] = r; signature_counts[signature] += 1
-    decisions[r["frame_id"]] = {
-        "quality_pass": quality, "rarity_score": r["rarity_score"], "nearest_hamming": distance,
-        "duplicate_of": prior["frame_id"] if prior else None, "retained_curated": keep,
-        "curation_reason": reason, "training_eligible": True,
-    }
+def cosine(a, b):
+    return float(np.dot(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)))
 
-all_rows = table.search().select(["frame_id", "split"]).to_arrow().to_pylist()
-updates = []
-for row in all_rows:
-    d = decisions.get(row["frame_id"], {
-        "quality_pass": None, "rarity_score": None, "nearest_hamming": None, "duplicate_of": None,
-        "retained_curated": False, "curation_reason": "held_out_sequence", "training_eligible": False,
-    })
-    updates.append({"frame_id": row["frame_id"], **d})
+@geneva.udtf(
+    output_schema=CURATION_SCHEMA,
+    input_columns=["frame_id", "sample_id", "time_offset_s", "is_key_frame", "labels",
+                   "brightness", "blur_score", "dhash_embedding", "semantic_embedding"],
+    version="quality-balance-perceptual-semantic-v2",
+)
+def curate_training(source):
+    records = source.select([
+        "frame_id", "sample_id", "time_offset_s", "is_key_frame", "labels",
+        "brightness", "blur_score", "dhash_embedding", "semantic_embedding",
+    ]).to_arrow().to_pylist()
+    records.sort(key=lambda r: (r["sample_id"], r["time_offset_s"]))
+    prevalence = {label: np.mean([label in r["labels"] for r in records]) for label in LABELS}
+    for r in records:
+        positive = [x for x in LABELS if x in r["labels"]]
+        negative = [x for x in LABELS if x not in r["labels"]]
+        r["rarity_score"] = float(np.mean(
+            [1 / np.sqrt(max(prevalence[x], 1e-6)) for x in positive] +
+            [0.25 / np.sqrt(max(1 - prevalence[x], 1e-6)) for x in negative]
+        ))
+    blur_floor = max(15.0, float(np.quantile([r["blur_score"] for r in records], .03)))
+    rare_cut = float(np.quantile([r["rarity_score"] for r in records], .80))
+    kept_by_sample, signature_counts, output = defaultdict(list), Counter(), []
+    for r in records:
+        quality = 18 <= r["brightness"] <= 238 and r["blur_score"] >= blur_floor
+        signature = tuple(r["labels"])
+        candidates = kept_by_sample[r["sample_id"]]
+        nearest = max(candidates, key=lambda x: cosine(r["semantic_embedding"], x["semantic_embedding"]), default=None)
+        sem = cosine(r["semantic_embedding"], nearest["semantic_embedding"]) if nearest else 0.0
+        ham = hamming(r["dhash_embedding"], nearest["dhash_embedding"]) if nearest else 64
+        same_labels = nearest is not None and tuple(nearest["labels"]) == signature
+        perceptual_duplicate = same_labels and ham <= PERCEPTUAL_HAMMING_THRESHOLD
+        semantic_duplicate = same_labels and sem >= SEMANTIC_COSINE_THRESHOLD and ham <= SEMANTIC_DHASH_GUARD
+        rare = r["rarity_score"] >= rare_cut
+        protected_rare_spacing = rare and (nearest is None or abs(r["time_offset_s"] - nearest["time_offset_s"]) >= 1.0)
+        if not quality:
+            keep, reason, method = False, "filtered_low_quality", "none"
+        elif r["is_key_frame"]:
+            keep, reason, method = True, "retained_annotated_keyframe", "none"
+        elif perceptual_duplicate and not protected_rare_spacing:
+            keep, reason, method = False, "dropped_perceptual_duplicate", "dhash"
+        elif semantic_duplicate and not protected_rare_spacing:
+            keep, reason, method = False, "dropped_semantic_duplicate", "resnet18+high_cosine+dhash_guard"
+        elif signature_counts[signature] >= 18 and not rare:
+            keep, reason, method = False, "dropped_balance_cap", "none"
+        else:
+            keep, reason, method = True, "retained_rare" if rare else "retained_balanced", "none"
+        if keep:
+            kept_by_sample[r["sample_id"]].append(r); signature_counts[signature] += 1
+        output.append({
+            "frame_id": r["frame_id"], "quality_pass": quality, "rarity_score": r["rarity_score"],
+            "nearest_hamming": ham, "nearest_semantic_cosine": sem,
+            "duplicate_of": nearest["frame_id"] if nearest else None, "duplicate_method": method,
+            "retained_curated": keep, "curation_reason": reason, "training_eligible": True,
+        })
+    yield pa.RecordBatch.from_pylist(output, schema=CURATION_SCHEMA)
+
+decision_view_name = "training_curation_decisions"
+if decision_view_name in db.table_names():
+    db.drop_table(decision_view_name)
+source_query = table.search().where("split = 'train'")
+curation_backend = "LanceDB Feature Engineering UDTF materialized view"
+try:
+    with db.local_ray_context():
+        decision_view = db.create_udtf_view(decision_view_name, source_query, curate_training)
+        decision_view.refresh(concurrency=1, _admission_check=False)
+    decision_table = decision_view.to_arrow()
+except Exception as exc:
+    curation_backend = f"same UDTF, in-process executor fallback ({type(exc).__name__})"
+    warnings.warn(f"UDTF worker executor unavailable; invoking the same UDTF locally: {exc}")
+    decision_table = pa.Table.from_batches(list(curate_training.execute(source_query)), schema=CURATION_SCHEMA)
+    decision_view = db.create_table(decision_view_name, decision_table, mode="overwrite")
 
 new_columns = {
     "quality_pass": "cast(null as boolean)", "rarity_score": "cast(null as float)",
-    "nearest_hamming": "cast(null as int)", "duplicate_of": "cast(null as string)",
+    "nearest_hamming": "cast(null as int)", "nearest_semantic_cosine": "cast(null as float)",
+    "duplicate_of": "cast(null as string)", "duplicate_method": "cast(null as string)",
     "retained_curated": "cast(null as boolean)", "curation_reason": "cast(null as string)",
     "training_eligible": "cast(null as boolean)",
 }
 for name, expr in new_columns.items():
     if name not in table.schema.names: table.add_columns({name: expr})
-table.merge_insert("frame_id").when_matched_update_all().execute(pa.Table.from_pylist(updates))
+
+held_out = table.search().where("split != 'train'").select(["frame_id"]).to_arrow().to_pylist()
+held_out_updates = [{"frame_id": r["frame_id"], "retained_curated": False,
+                     "curation_reason": "held_out_independent_log", "training_eligible": False,
+                     "duplicate_method": "none"} for r in held_out]
+table.merge_insert("frame_id").when_matched_update_all().execute(decision_table)
+table.merge_insert("frame_id").when_matched_update_all().execute(pa.Table.from_pylist(held_out_updates))
 
 raw_count = table.count_rows("split = 'train'")
 curated_count = table.count_rows("split = 'train' AND retained_curated = true")
+reason_counts = (table.search().where("split = 'train'").select(["curation_reason"]).to_arrow().to_pandas()["curation_reason"].value_counts())
+print("Curation backend:", curation_backend)
 display(pd.DataFrame({"dataset": ["raw_train", "curated_train"], "examples": [raw_count, curated_count],
-                      "fraction_of_raw": [1.0, curated_count/raw_count]}).style.format({"fraction_of_raw": "{:.1%}"}))
+                      "fraction_of_raw": [1.0, curated_count / raw_count]}).style.format({"fraction_of_raw": "{:.1%}"}))
+display(reason_counts.rename_axis("reason").to_frame("frames"))
 display(table.search().where("split = 'train'").select([
-    "frame_id", "time_s", "rarity_score", "nearest_hamming", "retained_curated", "curation_reason"
-]).limit(12).to_arrow().to_pandas())
-print(f"Quality floor: blur ≥ {blur_floor:.1f}; rare-signature cut: {rare_cut:.2f}; table version: {table.version}")
+    "frame_id", "is_key_frame", "nearest_hamming", "nearest_semantic_cosine",
+    "duplicate_method", "retained_curated", "curation_reason"
+]).limit(14).to_arrow().to_pandas())
 """
     ),
     code(
@@ -567,250 +757,333 @@ for dataset_name, predicate in [("raw_train", "split = 'train'"),
 cur_dist = pd.DataFrame(cur_dist)
 display(cur_dist.pivot(index="label", columns="dataset", values="positive_rate").style.format("{:.0%}"))
 sns.barplot(data=cur_dist, x="label", y="positive_rate", hue="dataset")
-plt.xticks(rotation=30, ha="right"); plt.title("Training distribution after curation"); plt.tight_layout(); plt.show()
+plt.xticks(rotation=28, ha="right"); plt.title("Training distribution after UDTF curation")
+plt.tight_layout(); plt.show()
 """
     ),
     md(
         r"""
-## 6. Post-train a 2B VLM on the Mac
+## 6. Full-model training directly from LanceDB
 
-We train two QLoRA adapters from the same 4-bit Qwen2-VL checkpoint with identical hyperparameters. The raw adapter sees every training frame; the curated adapter sees only retained rows. With one epoch, fewer examples also mean fewer optimizer steps and a shorter run—the efficiency comparison is real rather than normalized away.
+This version performs **full fine-tuning**, not LoRA: every language, connector, and vision parameter is trainable. The model is intentionally small—SmolVLM-256M in bfloat16—so two one-epoch runs remain practical on Apple Silicon or an NVIDIA GPU. The code verifies that the vision tower is trainable and reports the trainable parameter count.
 
-MLX-VLM's current local loader expects an image-folder dataset. The canonical images and records still come directly from LanceDB; the next cell writes a resized, disposable compatibility cache plus `metadata.jsonl`. This is the one filesystem bridge in the workflow, not a second source of truth.
+There is no image-folder bridge. The dataset keeps only frame IDs in memory; each `__getitem__` performs a LanceDB point query for `model_image` and `label_text`, decodes the bytes, and passes the image to the processor. `num_workers=0` is intentional because the in-process LanceDB table handle stays in the training process.
+
+Raw and curated conditions use identical learning rate, epoch count, model initialization, and sample order seed. Because curated training has fewer examples, it also has fewer optimizer steps; this measures end-to-end quality/efficiency. A controlled equal-step study would answer a different question.
 """
     ),
     code(
         r"""
-MLX_DATA = ARTIFACTS / "mlx_data"
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
-def export_imagefolder(name: str, predicate: str):
-    out = MLX_DATA / name
-    metadata_path = out / "metadata.jsonl"
-    records = table.search().where(predicate).select(["frame_id", "image", "label_text"]).to_arrow().to_pylist()
-    expected = len(records)
-    cached_images = list(out.glob("*.jpg")) if out.exists() else []
-    cache_matches = False
-    if metadata_path.exists() and len(cached_images) == expected and sum(1 for _ in open(metadata_path)) == expected:
-        with Image.open(cached_images[0]) as cached: cache_matches = cached.size == IMAGE_SIZE
-    if cache_matches:
-        print(f"Cache hit: {name} ({expected} records)"); return out, expected
-    if out.exists(): shutil.rmtree(out)
-    out.mkdir(parents=True)
-    with open(metadata_path, "w") as meta:
-        for row in tqdm(records, desc=f"Export {name}"):
-            filename = f"{row['frame_id']}.jpg"
-            with Image.open(io.BytesIO(row["image"])) as im:
-                im.convert("RGB").resize(IMAGE_SIZE, Image.Resampling.LANCZOS).save(out / filename, quality=90)
-            meta.write(json.dumps({"file_name": filename, "question": QUESTION, "answer": row["label_text"]}) + "\n")
-    return out, expected
+training_config = {
+    "model": MODEL_ID, "full_finetune": True, "train_vision": True,
+    "epochs": EPOCHS, "learning_rate": LEARNING_RATE, "batch_size": 1,
+    "model_image_size": MODEL_IMAGE_SIZE, "question": QUESTION,
+    "seed": SEED, "source_sha256": SOURCE_SHA256,
+    "curation": {
+        "semantic_cosine": SEMANTIC_COSINE_THRESHOLD,
+        "semantic_dhash_guard": SEMANTIC_DHASH_GUARD,
+        "perceptual_hamming": PERCEPTUAL_HAMMING_THRESHOLD,
+    },
+}
+experiment_fingerprint = hashlib.sha256(json.dumps(training_config, sort_keys=True).encode()).hexdigest()
+print("Experiment fingerprint:", experiment_fingerprint[:16])
 
-raw_dir, raw_n = export_imagefolder("raw_train", "split = 'train'")
-curated_dir, curated_n = export_imagefolder("curated_train", "split = 'train' AND retained_curated = true")
-test_dir, test_n = export_imagefolder("test", "split = 'test'")
-print({"raw_train": raw_n, "curated_train": curated_n, "test": test_n})
-"""
-    ),
-    code(
-        r"""
-from argparse import Namespace
+def load_processor(path=MODEL_ID):
+    processor = AutoProcessor.from_pretrained(path)
+    # The model was trained at 512px. Disabling tiling reduces one driving frame from many crops to one image.
+    processor.image_processor.do_image_splitting = False
+    processor.image_processor.size = {"longest_edge": 512}
+    processor.image_processor.max_image_size = {"longest_edge": 512}
+    return processor
 
-ADAPTERS = ARTIFACTS / "adapters"; ADAPTERS.mkdir(exist_ok=True)
-TRAINING = ARTIFACTS / "training"; TRAINING.mkdir(exist_ok=True)
+def load_model(path=MODEL_ID):
+    model = AutoModelForImageTextToText.from_pretrained(path, dtype=MODEL_DTYPE).to(DEVICE)
+    model.config.pad_token_id = 2
+    model.generation_config.pad_token_id = 2
+    return model
 
-def train_adapter(name: str, dataset_dir: Path, examples: int):
-    adapter_dir = ADAPTERS / name
-    adapter = adapter_dir / "adapters.safetensors"
-    stats_path = TRAINING / f"{name}.json"
-    # Migrate the single-file layout produced by earlier MLX-VLM releases/runs.
-    legacy = ADAPTERS / f"{name}.safetensors"
-    shared_config = ADAPTERS / "adapter_config.json"
-    if not adapter.exists() and legacy.exists() and shared_config.exists():
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(legacy, adapter); shutil.copy2(shared_config, adapter_dir / "adapter_config.json")
-        if stats_path.exists():
-            migrated = json.loads(stats_path.read_text()); migrated["adapter"] = str(adapter_dir)
-            stats_path.write_text(json.dumps(migrated, indent=2))
-    if adapter.exists() and stats_path.exists():
-        print(f"Cache hit: {name} adapter")
-        return json.loads(stats_path.read_text())
-    adapter_dir.mkdir(parents=True, exist_ok=True)
-    from mlx_vlm.lora import main as lora_main
-    args = Namespace(
-        model_path=MODEL_ID, dataset=str(dataset_dir), split="train", dataset_config=None,
-        image_resize_shape=[IMAGE_SIZE[1], IMAGE_SIZE[0]], custom_prompt_format=None,
-        learning_rate=1e-4, batch_size=1, iters=examples * EPOCHS, epochs=EPOCHS,
-        steps_per_report=10, steps_per_eval=10_000, steps_per_save=10_000, val_batches=0,
-        max_seq_length=512, grad_checkpoint=False, grad_clip=1.0,
-        train_on_completions=True, gradient_accumulation_steps=1, assistant_id=77091,
-        lora_alpha=16, lora_rank=8, lora_dropout=0.0, train_mode="sft", beta=0.1, eps=1e-8,
-        output_path=str(adapter), adapter_path=None, full_finetune=False, train_vision=False,
-    )
-    started = time.perf_counter(); lora_main(args); elapsed = time.perf_counter() - started
-    stats = {"condition": name, "examples": examples, "epochs": EPOCHS, "optimizer_steps": examples * EPOCHS,
-             "seconds": elapsed, "examples_per_second": examples / elapsed, "adapter": str(adapter_dir)}
-    stats_path.write_text(json.dumps(stats, indent=2)); gc.collect()
-    try:
-        import mlx.core as mx; mx.clear_cache()
-    except Exception: pass
+class LanceVisionDataset:
+    def __init__(self, table, predicate, processor):
+        self.table, self.processor = table, processor
+        self.frame_ids = sorted(r["frame_id"] for r in table.search().where(predicate).select(["frame_id"]).to_arrow().to_pylist())
+    def __len__(self): return len(self.frame_ids)
+    def record(self, index):
+        frame_id = self.frame_ids[index]
+        result = (self.table.search().where(f"frame_id = '{frame_id}'")
+                  .select(["frame_id", "model_image", "label_text", "labels"]).limit(1).to_arrow().to_pylist())
+        if len(result) != 1: raise KeyError(frame_id)
+        return result[0]
+    def __getitem__(self, index):
+        row = self.record(index)
+        image = Image.open(io.BytesIO(row["model_image"])).convert("RGB")
+        user = {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": QUESTION}]}
+        assistant = {"role": "assistant", "content": [{"type": "text", "text": row["label_text"]}]}
+        encoded = self.processor.apply_chat_template([user, assistant], add_generation_prompt=False,
+                                                     tokenize=True, return_dict=True, return_tensors="pt")
+        prompt = self.processor.apply_chat_template([user], add_generation_prompt=True,
+                                                    tokenize=True, return_dict=True, return_tensors="pt")
+        labels = encoded["input_ids"].clone()
+        labels[:, :prompt["input_ids"].shape[1]] = -100
+        encoded["labels"] = labels
+        return {k: v.to(DEVICE) for k, v in encoded.items() if torch.is_tensor(v)}
+
+def mean_validation_loss(model, processor):
+    dataset = LanceVisionDataset(table, "split = 'validation'", processor)
+    positions = np.linspace(0, len(dataset) - 1, min(VALIDATION_LOSS_EXAMPLES, len(dataset)), dtype=int)
+    losses = []
+    model.eval()
+    with torch.inference_mode():
+        for i in positions:
+            losses.append(float(model(**dataset[int(i)]).loss.detach().cpu()))
+    model.train()
+    return float(np.mean(losses))
+
+def train_full_model(name, predicate):
+    if DEVICE.type == "cpu" and not ALLOW_CPU_FULL_TRAINING:
+        raise RuntimeError("Full training on CPU is disabled by default. Use Apple Metal/NVIDIA CUDA, or set ALLOW_CPU_FULL_TRAINING=1 before starting Jupyter.")
+    checkpoint = ARTIFACTS / "models" / f"{name}-{experiment_fingerprint[:12]}"
+    stats_path = checkpoint / "training_stats.json"
+    if (checkpoint / "model.safetensors").exists() and stats_path.exists():
+        stats = json.loads(stats_path.read_text())
+        if stats.get("fingerprint") == experiment_fingerprint:
+            print(f"Cache hit: {name} full model"); return stats
+    if checkpoint.exists(): shutil.rmtree(checkpoint)
+    checkpoint.mkdir(parents=True)
+    processor, model = load_processor(), load_model()
+    for parameter in model.parameters(): parameter.requires_grad_(True)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    vision_trainable = all(p.requires_grad for p in model.model.vision_model.parameters())
+    if trainable_params != total_params or not vision_trainable:
+        raise RuntimeError("Full fine-tuning invariant failed: not every parameter, including vision, is trainable")
+    model.config.use_cache = False
+    dataset = LanceVisionDataset(table, predicate, processor)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    history, started = [], time.perf_counter()
+    model.train()
+    for epoch in range(EPOCHS):
+        generator = torch.Generator().manual_seed(SEED + epoch)
+        order = torch.randperm(len(dataset), generator=generator).tolist()
+        progress = tqdm(order, desc=f"Full-train {name}")
+        for step, index in enumerate(progress, 1):
+            optimizer.zero_grad(set_to_none=True)
+            loss = model(**dataset[index]).loss
+            if not torch.isfinite(loss): raise RuntimeError(f"Non-finite loss at step {step}: {loss}")
+            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+            value = float(loss.detach().cpu()); history.append(value)
+            if step % 10 == 0: progress.set_postfix(loss=f"{np.mean(history[-10:]):.3f}")
+    if DEVICE.type == "mps": torch.mps.synchronize()
+    elif DEVICE.type == "cuda": torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+    validation_loss = mean_validation_loss(model, processor)
+    model.config.use_cache = True
+    model.save_pretrained(checkpoint, safe_serialization=True)
+    processor.save_pretrained(checkpoint)
+    stats = {
+        "condition": name, "fingerprint": experiment_fingerprint, "checkpoint": str(checkpoint),
+        "examples": len(dataset), "epochs": EPOCHS, "optimizer_steps": len(dataset) * EPOCHS,
+        "seconds": elapsed, "examples_per_second": len(dataset) / elapsed,
+        "final_train_loss_10_step_mean": float(np.mean(history[-10:])), "validation_loss": validation_loss,
+        "total_parameters": total_params, "trainable_parameters": trainable_params,
+        "vision_trainable": vision_trainable, "full_finetune": True,
+    }
+    stats_path.write_text(json.dumps(stats, indent=2))
+    del model, processor, optimizer; gc.collect()
+    if DEVICE.type == "mps": torch.mps.empty_cache()
+    elif DEVICE.type == "cuda": torch.cuda.empty_cache()
     return stats
 
-raw_stats = train_adapter("raw", raw_dir, raw_n)
-curated_stats = train_adapter("curated", curated_dir, curated_n)
+raw_stats = train_full_model("raw", "split = 'train'")
+curated_stats = train_full_model("curated", "split = 'train' AND retained_curated = true")
 training_stats = pd.DataFrame([raw_stats, curated_stats])
-display(training_stats[["condition", "examples", "epochs", "optimizer_steps", "seconds", "examples_per_second"]])
+display(training_stats[["condition", "examples", "optimizer_steps", "seconds", "validation_loss",
+                        "trainable_parameters", "vision_trainable", "full_finetune"]].style.format({
+    "seconds": "{:.1f}", "validation_loss": "{:.3f}", "trainable_parameters": "{:,}"}))
 """
     ),
     md(
         r"""
-## 7. Did curation actually help?
+## 7. Strict held-out evaluation
 
-All three conditions are evaluated on exactly the same held-out sequences. Generation is deterministic, predictions are cached, and the parser accepts only the six declared label names. We report macro F1 as the primary metric, plus micro F1, exact-set accuracy, and per-class F1 so a common class cannot hide a rare-class failure.
+All conditions are evaluated on the same complete held-out driving logs. Generation is greedy. The parser calls `json.loads` on the entire response and accepts only a unique list of declared label strings. Prose, Markdown fences, unknown labels, duplicates, or malformed JSON are invalid and score as an empty prediction; format compliance is reported separately.
 
-Qualitative examples are selected by position—first, middle, and last test frame—not by correctness. The interpretation cell reports the observed result even if curation loses.
+Macro F1 is primary, with micro F1, exact-set accuracy, per-class precision/recall/F1, and JSON compliance. Qualitative examples are fixed by position—first, one-third, two-thirds, and last—not selected by correctness.
 """
     ),
     code(
         r"""
-EVAL = ARTIFACTS / "eval"; EVAL.mkdir(exist_ok=True)
-test_meta = [json.loads(line) for line in open(test_dir / "metadata.jsonl")]
+EVAL_DIR = ARTIFACTS / "eval"; EVAL_DIR.mkdir(parents=True, exist_ok=True)
+test_ids = sorted(r["frame_id"] for r in table.search().where("split = 'test'").select(["frame_id"]).to_arrow().to_pylist())
 
-def parse_prediction(text: str):
-    normalized = text.lower().replace("-", "_").replace(" ", "_")
-    return [label for label in LABELS if label in normalized]
+def strict_parse_prediction(text: str):
+    try:
+        value = json.loads(text.strip())
+    except (json.JSONDecodeError, TypeError):
+        return [], False, "malformed_json"
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        return [], False, "not_string_array"
+    if len(value) != len(set(value)):
+        return [], False, "duplicate_labels"
+    unknown = [x for x in value if x not in LABELS]
+    if unknown:
+        return [], False, "unknown_labels"
+    return [x for x in LABELS if x in value], True, "valid"
 
-def evaluate_condition(condition: str, adapter: str | None):
-    cache = EVAL / f"{condition}_predictions.jsonl"
-    if cache.exists() and sum(1 for _ in open(cache)) == len(test_meta):
-        print(f"Cache hit: {condition} predictions")
-        return [json.loads(line) for line in open(cache)]
-    from mlx_vlm import load, generate
-    from mlx_vlm.prompt_utils import apply_chat_template
-    model, processor = load(MODEL_ID, adapter_path=adapter)
-    prompt = apply_chat_template(processor, model.config, QUESTION, num_images=1)
-    outputs = []
-    with open(cache, "w") as f:
-        for record in tqdm(test_meta, desc=f"Evaluate {condition}"):
-            result = generate(model, processor, prompt, image=str(test_dir / record["file_name"]),
-                              max_tokens=64, temperature=0.0, seed=SEED, verbose=False)
-            item = {"file_name": record["file_name"], "truth": json.loads(record["answer"]),
-                    "prediction": parse_prediction(result.text), "raw_text": result.text}
+def evaluate_condition(condition, checkpoint=None):
+    checkpoint_fingerprint = "vanilla" if checkpoint is None else hashlib.sha256((experiment_fingerprint + condition).encode()).hexdigest()
+    cache = EVAL_DIR / f"{condition}-{checkpoint_fingerprint[:12]}.jsonl"
+    if cache.exists():
+        cached = [json.loads(line) for line in open(cache)]
+        if len(cached) == len(test_ids) and [x["frame_id"] for x in cached] == test_ids:
+            print(f"Cache hit: {condition} predictions"); return cached
+    processor, model = load_processor(checkpoint or MODEL_ID), load_model(checkpoint or MODEL_ID)
+    model.eval(); outputs = []
+    with open(cache, "w") as f, torch.inference_mode():
+        for frame_id in tqdm(test_ids, desc=f"Evaluate {condition}"):
+            row = (table.search().where(f"frame_id = '{frame_id}'")
+                   .select(["frame_id", "model_image", "labels", "log_id", "camera_channel"])
+                   .limit(1).to_arrow().to_pylist()[0])
+            image = Image.open(io.BytesIO(row["model_image"])).convert("RGB")
+            messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": QUESTION}]}]
+            inputs = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
+                                                   return_dict=True, return_tensors="pt")
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items() if torch.is_tensor(v)}
+            generated = model.generate(**inputs, max_new_tokens=48, do_sample=False)
+            text = processor.decode(generated[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+            prediction, valid, format_error = strict_parse_prediction(text)
+            item = {"frame_id": frame_id, "truth": row["labels"], "prediction": prediction,
+                    "valid_json": valid, "format_error": format_error, "raw_text": text,
+                    "log_id": row["log_id"], "camera_channel": row["camera_channel"]}
             outputs.append(item); f.write(json.dumps(item) + "\n"); f.flush()
     del model, processor; gc.collect()
-    try:
-        import mlx.core as mx; mx.clear_cache()
-    except Exception: pass
+    if DEVICE.type == "mps": torch.mps.empty_cache()
+    elif DEVICE.type == "cuda": torch.cuda.empty_cache()
     return outputs
 
 prediction_sets = {
-    "vanilla": evaluate_condition("vanilla", None),
-    "raw_post_trained": evaluate_condition("raw_post_trained", raw_stats["adapter"]),
-    "curated_post_trained": evaluate_condition("curated_post_trained", curated_stats["adapter"]),
+    "vanilla": evaluate_condition("vanilla"),
+    "raw_full_trained": evaluate_condition("raw_full_trained", raw_stats["checkpoint"]),
+    "curated_full_trained": evaluate_condition("curated_full_trained", curated_stats["checkpoint"]),
 }
 """
     ),
     code(
         r"""
 def binary_matrix(label_lists):
-    return np.array([[label in labels for label in LABELS] for labels in label_lists], dtype=int)
+    return np.asarray([[label in labels for label in LABELS] for labels in label_lists], dtype=int)
 
 metric_rows, per_class_rows = [], []
 for condition, outputs in prediction_sets.items():
     y_true = binary_matrix([x["truth"] for x in outputs])
     y_pred = binary_matrix([x["prediction"] for x in outputs])
+    training = None if condition == "vanilla" else raw_stats if condition.startswith("raw") else curated_stats
     metric_rows.append({
         "condition": condition,
         "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
         "micro_f1": f1_score(y_true, y_pred, average="micro", zero_division=0),
         "exact_set_accuracy": np.mean(np.all(y_true == y_pred, axis=1)),
-        "training_examples": 0 if condition == "vanilla" else raw_n if condition == "raw_post_trained" else curated_n,
-        "training_seconds": 0 if condition == "vanilla" else raw_stats["seconds"] if condition == "raw_post_trained" else curated_stats["seconds"],
+        "json_compliance": np.mean([x["valid_json"] for x in outputs]),
+        "training_examples": 0 if training is None else training["examples"],
+        "training_seconds": 0 if training is None else training["seconds"],
     })
-    p, r, f, support = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0)
-    for label, pp, rr, ff, ss in zip(LABELS, p, r, f, support):
-        per_class_rows.append({"condition": condition, "label": label, "precision": pp, "recall": rr, "f1": ff, "positive_test_frames": ss})
+    precision, recall, f1, support = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0)
+    for label, p, r, score, n in zip(LABELS, precision, recall, f1, support):
+        per_class_rows.append({"condition": condition, "label": label, "precision": p, "recall": r,
+                               "f1": score, "positive_test_frames": n})
 
 results = pd.DataFrame(metric_rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
 per_class = pd.DataFrame(per_class_rows)
-display(results.style.format({"macro_f1": "{:.3f}", "micro_f1": "{:.3f}", "exact_set_accuracy": "{:.3f}", "training_seconds": "{:.1f}"}))
+display(results.style.format({"macro_f1": "{:.3f}", "micro_f1": "{:.3f}", "exact_set_accuracy": "{:.3f}",
+                              "json_compliance": "{:.1%}", "training_seconds": "{:.1f}"}))
 display(per_class.pivot(index="label", columns="condition", values="f1").style.format("{:.3f}"))
 
 sns.barplot(data=results, x="condition", y="macro_f1", hue="condition", legend=False)
-plt.ylim(0, 1); plt.ylabel("macro F1"); plt.xlabel(""); plt.title("Held-out sequence performance")
+plt.ylim(0, 1); plt.ylabel("macro F1"); plt.xlabel(""); plt.title("Held-out independent-log performance")
 for i, value in enumerate(results["macro_f1"]): plt.text(i, value + .02, f"{value:.3f}", ha="center")
-plt.tight_layout(); plt.show()
+plt.xticks(rotation=12); plt.tight_layout(); plt.show()
 """
     ),
     code(
         r"""
-raw_score = float(results.set_index("condition").loc["raw_post_trained", "macro_f1"])
-cur_score = float(results.set_index("condition").loc["curated_post_trained", "macro_f1"])
-delta = cur_score - raw_score
-efficiency = 1 - curated_n / raw_n
+raw_score = float(results.set_index("condition").loc["raw_full_trained", "macro_f1"])
+curated_score = float(results.set_index("condition").loc["curated_full_trained", "macro_f1"])
+delta, efficiency = curated_score - raw_score, 1 - curated_stats["examples"] / raw_stats["examples"]
 time_saved = 1 - curated_stats["seconds"] / raw_stats["seconds"]
-if delta > 0.01:
-    conclusion = f"Curation improved macro F1 by {delta:+.3f} while using {efficiency:.0%} fewer examples and {time_saved:.0%} less training time."
-elif delta >= -0.01:
-    conclusion = f"Curation matched raw post-training within 0.01 macro F1 while using {efficiency:.0%} fewer examples and {time_saved:.0%} less training time."
+if delta > .01:
+    conclusion = f"Curation improved macro F1 by {delta:+.3f} with {efficiency:.0%} fewer examples and {time_saved:.0%} less training time."
+elif delta >= -.01:
+    conclusion = f"Curation matched raw full training within 0.01 macro F1 with {efficiency:.0%} fewer examples and {time_saved:.0%} less training time."
 else:
-    conclusion = f"Curation reduced macro F1 by {delta:.3f}, despite using {efficiency:.0%} fewer examples. The efficiency gain did not compensate for lost coverage in this run."
-display(Markdown(f"### Observed result\n\n**{conclusion}**\n\nThis is one short scene. Inspect per-class support and errors before generalizing."))
-"""
-    ),
-    code(
-        r"""
-positions = [0, len(test_meta)//2, len(test_meta)-1]
-fig, axes = plt.subplots(len(positions), 1, figsize=(12, 4 * len(positions)))
-for ax, idx in zip(np.atleast_1d(axes), positions):
-    item = prediction_sets["vanilla"][idx]
-    ax.imshow(Image.open(test_dir / item["file_name"])); ax.axis("off")
-    lines = [f"ground truth: {item['truth']}"]
-    for condition in ["vanilla", "raw_post_trained", "curated_post_trained"]:
-        lines.append(f"{condition}: {prediction_sets[condition][idx]['prediction']}")
-    ax.set_title("\n".join(lines), loc="left", fontsize=9)
-plt.suptitle("Deterministic qualitative slice: first, middle, last test frame", fontweight="bold")
+    conclusion = f"Curation reduced macro F1 by {delta:.3f}; the {efficiency:.0%} data reduction did not preserve raw-model quality in this run."
+display(Markdown(f"### Observed result\n\n**{conclusion}**\n\nThis is a 50-sample mini release. Independent logs make the test more defensible, but confidence intervals and a larger official split are still needed before generalizing."))
+
+positions = sorted(set([0, len(test_ids)//3, 2*len(test_ids)//3, len(test_ids)-1]))
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+for ax, index in zip(np.asarray(axes).reshape(-1), positions):
+    frame_id = test_ids[index]
+    row = table.search().where(f"frame_id = '{frame_id}'").select(["model_image"]).limit(1).to_arrow().to_pylist()[0]
+    ax.imshow(Image.open(io.BytesIO(row["model_image"]))); ax.axis("off")
+    lines = [f"truth: {prediction_sets['vanilla'][index]['truth']}"]
+    for condition in ["vanilla", "raw_full_trained", "curated_full_trained"]:
+        item = prediction_sets[condition][index]
+        lines.append(f"{condition}: {item['prediction']} · JSON={'valid' if item['valid_json'] else item['format_error']}")
+    ax.set_title("\n".join(lines), loc="left", fontsize=8)
+plt.suptitle("Fixed qualitative slice: first, one-third, two-thirds, last test frame", fontweight="bold")
 plt.tight_layout(); plt.show()
 """
     ),
     md(
         r"""
-## 8. What changes at production scale
+## 8. What is—and is not—demonstrated
 
-The local experiment deliberately keeps the layers distinct:
-
-| Layer | Exercised here | What extends at scale |
+| Layer | Exercised here | Boundary |
 |---|---|---|
-| **Lance** | Open-source table format; JPEG bytes beside typed columns; random row access, scans, and table versions | The same object-store-backed multimodal data model can hold much larger fleets and richer modalities |
-| **LanceDB OSS** | Local/in-process table creation, SQL-style filters, merges, and vector similarity over one table | Larger local or self-managed query workloads and ANN indexes |
-| **LanceDB Enterprise** | **Not used by this notebook** | Managed distributed serving/operations against data in the customer's cloud/object storage: independent compute and storage, high-throughput caching, managed indexing and compaction, concurrency, and scaling |
-| **LanceDB Feature Engineering** | Versioned local UDF columns and backfills for brightness, blur, and dHash; an explicit in-process fallback if local Ray workers are unavailable | Continuous/incremental computation and backfill of derived columns across large multimodal tables, avoiding a collection of bespoke pipelines; Enterprise can auto-backfill and schedule at distributed scale |
+| **MCAP** | 50 compact, timestamped camera/annotation logs normalized from the public nuImages mini archive | The upstream release is an image dataset; the notebook performs the MCAP normalization explicitly |
+| **Lance** | Source JPEG, model-ready JPEG, typed metadata, labels, features, and curation audit columns | Additional image representations consume storage but eliminate a loose-file training cache |
+| **LanceDB OSS** | Local table creation, point reads during training, SQL-style filters, merges, and exact/vector search | The trainer is PyTorch; LanceDB supplies records but does not perform gradient updates |
+| **LanceDB Feature Engineering** | Versioned row UDF backfills plus a real cross-row UDTF materialized view for curation | The UDTF API is beta; restricted runtimes may use the same UDTF through the documented in-process executor fallback |
+| **Full VLM training** | All 256M parameters, including the vision tower, update on Metal/CUDA/CPU | This is scene tagging, not detection, tracking, sensor fusion, or an autonomous-driving policy |
+| **LanceDB Enterprise** | **Not used** | At larger scale it can add managed distributed execution/serving, independent compute and storage, caching, indexing, compaction, concurrency, and object-store operation |
 
-At production scale, scene-level splits would use many independent drives, label definitions would be validated across locations and weather, and curation thresholds would be calibrated on downstream metrics. The local result demonstrates the mechanics and audit trail, not an Enterprise deployment and not a safety claim.
+The 44-log split is a substantial correction over one short scene, but nuImages mini remains small. Sweep labels are inherited from a keyframe within ±1.5 seconds, which introduces controlled label noise. A benchmark run should use the full official train/validation releases, evaluate only directly annotated frames or temporal annotations, quantify uncertainty across multiple seeds, and tune curation thresholds on validation data only.
+
+All six camera positions are represented, but each record is still a single image. LiDAR, radar, ego motion, calibration-aware fusion, multi-view context, and temporal inputs are deliberately out of scope and should not be inferred from the results.
 """
     ),
     md(
         r"""
-## 9. Run manifest and limitations
+## 9. Run manifest and cache integrity
 
-We finish by binding results to the exact source checksum, Lance version, package versions, model, split counts, and adapter statistics. The manifest makes cached reruns inspectable.
-
-The main limitation is deliberate and visible: the only currently active public Foxglove nuScenes MCAP mirror is one short scene. Guarded temporal sequences prevent adjacent-frame leakage, but they cannot reproduce the diversity or statistical power of scene-level evaluation across many drives.
+The manifest binds the result to source bytes, feature and curation executors, model/training configuration, split groups, exact package versions, checkpoints, and metrics. Training and prediction cache paths contain the experiment fingerprint; changing a material input creates a new cache instead of silently reusing stale artifacts.
 """
     ),
     code(
         r"""
+import importlib.metadata as metadata
+
 manifest = {
-    "source": {"url": MCAP_URL, "sha256": digest, "bytes": MCAP_PATH.stat().st_size},
+    "source": {"url": SOURCE_URL, "sha256": SOURCE_SHA256, "bytes": SOURCE_ARCHIVE.stat().st_size,
+               "annotated_samples": len(samples), "independent_logs": len(set(groups))},
+    "mcap": {"directory": str(MCAP_DIR), "files": len(list(MCAP_DIR.glob("*.mcap"))),
+             "conversion_fingerprint": conversion_fingerprint},
     "table": {"path": str(DB_DIR), "name": TABLE_NAME, "version": table.version, "rows": table.count_rows()},
-    "splits": {s: table.count_rows(f"split = '{s}'") for s in ["train", "validation", "test"]},
-    "curated_train_rows": curated_count, "model": MODEL_ID, "seed": SEED,
-    "packages": {"lancedb": lancedb.__version__, "geneva": geneva.__version__},
-    "feature_backend": feature_backend,
+    "splits": {split: {"rows": table.count_rows(f"split = '{split}'"),
+                        "logs": len(set(r["log_id"] for r in table.search().where(f"split = '{split}'").select(["log_id"]).to_arrow().to_pylist()))}
+               for split in ["train", "validation", "test"]},
+    "feature_backend": feature_backend, "curation_backend": curation_backend,
+    "curated_train_rows": curated_count, "experiment_fingerprint": experiment_fingerprint,
+    "training_config": training_config, "hardware": hardware,
+    "packages": {name: metadata.version(name) for name in ["lancedb", "geneva", "mcap", "pyarrow", "torch", "torchvision", "transformers"]},
     "training": [raw_stats, curated_stats], "results": results.to_dict(orient="records"),
 }
-(ARTIFACTS / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
-display(pd.DataFrame(manifest["results"]).style.format({"macro_f1": "{:.3f}", "micro_f1": "{:.3f}", "exact_set_accuracy": "{:.3f}"}))
-print(f"Manifest: {ARTIFACTS / 'run_manifest.json'}")
-print(f"Canonical data: {DB_DIR / (TABLE_NAME + '.lance')}")
+manifest_path = ARTIFACTS / f"run_manifest-{experiment_fingerprint[:12]}.json"
+manifest_path.write_text(json.dumps(manifest, indent=2))
+display(pd.DataFrame(manifest["results"]).style.format({"macro_f1": "{:.3f}", "micro_f1": "{:.3f}",
+                                                        "exact_set_accuracy": "{:.3f}", "json_compliance": "{:.1%}"}))
+print("Manifest:", manifest_path)
+print("Canonical Lance table:", DB_DIR / f"{TABLE_NAME}.lance")
 """
     ),
 ]
