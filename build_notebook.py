@@ -24,9 +24,9 @@ cells = [
 
 ## A multi-log MCAP → LanceDB → full-VLM-training experiment
 
-**Research question.** Can a quality-filtered, perceptually and semantically deduplicated subset of autonomous-driving images match or beat full-model post-training on every available frame—and do so with less data and compute?
+**Research question.** Can a quality-filtered, perceptually and semantically deduplicated subset of autonomous-driving images match or beat full-model post-training on every available frame when both runs receive the same optimizer-update budget?
 
-**Populated reference run.** Curated full training reached **0.535 macro F1**, effectively matching raw full training at **0.537**, while using 161 instead of 187 frames (**14% fewer**) and 78.2 instead of 92.1 seconds (**15% less training time**). Strict JSON compliance improved from **75.8% to 84.8%**. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
+**Populated reference run.** Curated full training reached **0.563 macro F1** versus **0.537** for raw full training. It used 161 instead of 187 unique frames (**14% fewer**), while both runs received 187 optimizer updates and took essentially the same time (95.5 versus 96.2 seconds). Strict JSON compliance improved from **75.8% to 87.9%**. A paired bootstrap over the nine held-out logs gives a 95% interval of **−0.031 to +0.091** for the macro-F1 difference, so the observed win is promising but not statistically decisive. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
 
 This notebook builds compact MCAP logs from the official nuImages mini release, ingests them into one LanceDB table, computes governed feature columns, curates the training split with a LanceDB Feature Engineering UDTF, and fully fine-tunes a 256M open vision-language model directly from LanceDB rows. It compares the vanilla model, full training on all rows, and full training on curated rows.
 
@@ -125,7 +125,6 @@ SOURCE_SHA256 = "9f5da97c9a820785487daea1c0f156ae18ddf2ac7e90245fa6d502b400a732b
 TABLE_NAME = "nuimages_multicamera"
 MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"
 MODEL_IMAGE_SIZE = (512, 512)
-EPOCHS = 1
 LEARNING_RATE = 1e-5
 VALIDATION_LOSS_EXAMPLES = 12
 
@@ -646,7 +645,7 @@ def cosine(a, b):
     output_schema=CURATION_SCHEMA,
     input_columns=["frame_id", "sample_id", "time_offset_s", "is_key_frame", "labels",
                    "brightness", "blur_score", "dhash_embedding", "semantic_embedding"],
-    version="quality-balance-perceptual-semantic-v2",
+    version="quality-balance-perceptual-semantic-v3",
 )
 def curate_training(source):
     records = source.select([
@@ -677,10 +676,12 @@ def curate_training(source):
         semantic_duplicate = same_labels and sem >= SEMANTIC_COSINE_THRESHOLD and ham <= SEMANTIC_DHASH_GUARD
         rare = r["rarity_score"] >= rare_cut
         protected_rare_spacing = rare and (nearest is None or abs(r["time_offset_s"] - nearest["time_offset_s"]) >= 1.0)
-        if not quality:
-            keep, reason, method = False, "filtered_low_quality", "none"
-        elif r["is_key_frame"]:
+        # Keyframes carry direct human annotations. Preserve them even when an image-quality
+        # heuristic fires; the sweep rows have propagated labels and are safer to discard.
+        if r["is_key_frame"]:
             keep, reason, method = True, "retained_annotated_keyframe", "none"
+        elif not quality:
+            keep, reason, method = False, "filtered_low_quality", "none"
         elif perceptual_duplicate and not protected_rare_spacing:
             keep, reason, method = False, "dropped_perceptual_duplicate", "dhash"
         elif semantic_duplicate and not protected_rare_spacing:
@@ -769,7 +770,7 @@ This version performs **full fine-tuning**, not LoRA: every language, connector,
 
 There is no image-folder bridge. The dataset keeps only frame IDs in memory; each `__getitem__` performs a LanceDB point query for `model_image` and `label_text`, decodes the bytes, and passes the image to the processor. `num_workers=0` is intentional because the in-process LanceDB table handle stays in the training process.
 
-Raw and curated conditions use identical learning rate, epoch count, model initialization, and sample order seed. Because curated training has fewer examples, it also has fewer optimizer steps; this measures end-to-end quality/efficiency. A controlled equal-step study would answer a different question.
+Raw and curated conditions use identical learning rate, model initialization, sample-order seed, and **optimizer-step budget**. The curated set is smaller, so its deterministic sampler starts a second shuffled pass to reach the same number of updates as raw. This isolates data selection from training compute; the comparison no longer handicaps curation by giving it fewer learning opportunities.
 """
     ),
     code(
@@ -778,7 +779,8 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 training_config = {
     "model": MODEL_ID, "full_finetune": True, "train_vision": True,
-    "epochs": EPOCHS, "learning_rate": LEARNING_RATE, "batch_size": 1,
+    "optimizer_step_policy": "equal_to_raw_train_rows", "optimizer_steps": raw_count,
+    "learning_rate": LEARNING_RATE, "batch_size": 1,
     "model_image_size": MODEL_IMAGE_SIZE, "question": QUESTION,
     "seed": SEED, "source_sha256": SOURCE_SHA256,
     "curation": {
@@ -863,17 +865,21 @@ def train_full_model(name, predicate):
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     history, started = [], time.perf_counter()
     model.train()
-    for epoch in range(EPOCHS):
-        generator = torch.Generator().manual_seed(SEED + epoch)
+    optimizer_steps = raw_count
+    completed, cycle = 0, 0
+    progress = tqdm(total=optimizer_steps, desc=f"Full-train {name}")
+    while completed < optimizer_steps:
+        generator = torch.Generator().manual_seed(SEED + cycle)
         order = torch.randperm(len(dataset), generator=generator).tolist()
-        progress = tqdm(order, desc=f"Full-train {name}")
-        for step, index in enumerate(progress, 1):
+        for index in order[:optimizer_steps - completed]:
             optimizer.zero_grad(set_to_none=True)
             loss = model(**dataset[index]).loss
-            if not torch.isfinite(loss): raise RuntimeError(f"Non-finite loss at step {step}: {loss}")
+            if not torch.isfinite(loss): raise RuntimeError(f"Non-finite loss at step {completed + 1}: {loss}")
             loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-            value = float(loss.detach().cpu()); history.append(value)
-            if step % 10 == 0: progress.set_postfix(loss=f"{np.mean(history[-10:]):.3f}")
+            value = float(loss.detach().cpu()); history.append(value); completed += 1; progress.update(1)
+            if completed % 10 == 0: progress.set_postfix(loss=f"{np.mean(history[-10:]):.3f}")
+        cycle += 1
+    progress.close()
     if DEVICE.type == "mps": torch.mps.synchronize()
     elif DEVICE.type == "cuda": torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
@@ -883,7 +889,8 @@ def train_full_model(name, predicate):
     processor.save_pretrained(checkpoint)
     stats = {
         "condition": name, "fingerprint": experiment_fingerprint, "checkpoint": str(checkpoint),
-        "examples": len(dataset), "epochs": EPOCHS, "optimizer_steps": len(dataset) * EPOCHS,
+        "examples": len(dataset), "examples_seen": optimizer_steps,
+        "effective_epochs": optimizer_steps / len(dataset), "optimizer_steps": optimizer_steps,
         "seconds": elapsed, "examples_per_second": len(dataset) / elapsed,
         "final_train_loss_10_step_mean": float(np.mean(history[-10:])), "validation_loss": validation_loss,
         "total_parameters": total_params, "trainable_parameters": trainable_params,
@@ -898,9 +905,9 @@ def train_full_model(name, predicate):
 raw_stats = train_full_model("raw", "split = 'train'")
 curated_stats = train_full_model("curated", "split = 'train' AND retained_curated = true")
 training_stats = pd.DataFrame([raw_stats, curated_stats])
-display(training_stats[["condition", "examples", "optimizer_steps", "seconds", "validation_loss",
+display(training_stats[["condition", "examples", "examples_seen", "effective_epochs", "optimizer_steps", "seconds", "validation_loss",
                         "trainable_parameters", "vision_trainable", "full_finetune"]].style.format({
-    "seconds": "{:.1f}", "validation_loss": "{:.3f}", "trainable_parameters": "{:,}"}))
+    "seconds": "{:.1f}", "effective_epochs": "{:.2f}", "validation_loss": "{:.3f}", "trainable_parameters": "{:,}"}))
 """
     ),
     md(
@@ -986,6 +993,7 @@ for condition, outputs in prediction_sets.items():
         "exact_set_accuracy": np.mean(np.all(y_true == y_pred, axis=1)),
         "json_compliance": np.mean([x["valid_json"] for x in outputs]),
         "training_examples": 0 if training is None else training["examples"],
+        "optimizer_steps": 0 if training is None else training["optimizer_steps"],
         "training_seconds": 0 if training is None else training["seconds"],
     })
     precision, recall, f1, support = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0)
@@ -1010,14 +1018,31 @@ plt.xticks(rotation=12); plt.tight_layout(); plt.show()
 raw_score = float(results.set_index("condition").loc["raw_full_trained", "macro_f1"])
 curated_score = float(results.set_index("condition").loc["curated_full_trained", "macro_f1"])
 delta, efficiency = curated_score - raw_score, 1 - curated_stats["examples"] / raw_stats["examples"]
-time_saved = 1 - curated_stats["seconds"] / raw_stats["seconds"]
-if delta > .01:
-    conclusion = f"Curation improved macro F1 by {delta:+.3f} with {efficiency:.0%} fewer examples and {time_saved:.0%} less training time."
-elif delta >= -.01:
-    conclusion = f"Curation matched raw full training within 0.01 macro F1 with {efficiency:.0%} fewer examples and {time_saved:.0%} less training time."
-else:
-    conclusion = f"Curation reduced macro F1 by {delta:.3f}; the {efficiency:.0%} data reduction did not preserve raw-model quality in this run."
-display(Markdown(f"### Observed result\n\n**{conclusion}**\n\nThis is a 50-sample mini release. Independent logs make the test more defensible, but confidence intervals and a larger official split are still needed before generalizing."))
+
+# Paired cluster bootstrap: resample whole held-out logs, not correlated frames.
+raw_outputs, curated_outputs = prediction_sets["raw_full_trained"], prediction_sets["curated_full_trained"]
+test_logs = sorted(set(x["log_id"] for x in raw_outputs))
+indices_by_log = {log: [i for i, x in enumerate(raw_outputs) if x["log_id"] == log] for log in test_logs}
+rng, bootstrap_deltas = np.random.default_rng(SEED), []
+for _ in range(5_000):
+    sampled_logs = rng.choice(test_logs, size=len(test_logs), replace=True)
+    indices = np.concatenate([indices_by_log[log] for log in sampled_logs])
+    y_true = binary_matrix([raw_outputs[i]["truth"] for i in indices])
+    y_raw = binary_matrix([raw_outputs[i]["prediction"] for i in indices])
+    y_curated = binary_matrix([curated_outputs[i]["prediction"] for i in indices])
+    bootstrap_deltas.append(
+        f1_score(y_true, y_curated, average="macro", zero_division=0)
+        - f1_score(y_true, y_raw, average="macro", zero_division=0)
+    )
+ci_low, ci_high = np.quantile(bootstrap_deltas, [.025, .975])
+win_probability = np.mean(np.asarray(bootstrap_deltas) > 0)
+
+conclusion = (
+    f"The curated point estimate improved macro F1 by {delta:+.3f} with {efficiency:.0%} fewer unique "
+    f"frames at the same {raw_stats['optimizer_steps']}-update budget. Its log-cluster bootstrap 95% interval "
+    f"is [{ci_low:+.3f}, {ci_high:+.3f}] (positive in {win_probability:.1%} of resamples)."
+)
+display(Markdown(f"### Observed result\n\n**{conclusion}**\n\nBecause the interval includes zero, this run shows an observed advantage—not proof that curation will win generally. The correct next step is a larger official split and multiple training seeds, not test-set threshold tuning."))
 
 positions = sorted(set([0, len(test_ids)//3, 2*len(test_ids)//3, len(test_ids)-1]))
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -1047,7 +1072,7 @@ plt.tight_layout(); plt.show()
 | **Full VLM training** | All 256M parameters, including the vision tower, update on Metal/CUDA/CPU | This is scene tagging, not detection, tracking, sensor fusion, or an autonomous-driving policy |
 | **LanceDB Enterprise** | **Not used** | At larger scale it can add managed distributed execution/serving, independent compute and storage, caching, indexing, compaction, concurrency, and object-store operation |
 
-The 44-log split is a substantial correction over one short scene, but nuImages mini remains small. Sweep labels are inherited from a keyframe within ±1.5 seconds, which introduces controlled label noise. A benchmark run should use the full official train/validation releases, evaluate only directly annotated frames or temporal annotations, quantify uncertainty across multiple seeds, and tune curation thresholds on validation data only.
+The 44-log split is a substantial correction over one short scene, but nuImages mini remains small. Sweep labels are inherited from a keyframe within ±1.5 seconds, which introduces controlled label noise. The reported paired bootstrap resamples whole test logs and its interval still spans zero. A benchmark run should use the full official train/validation releases, evaluate only directly annotated frames or temporal annotations, quantify uncertainty across multiple training seeds, and tune curation thresholds on validation data only.
 
 All six camera positions are represented, but each record is still a single image. LiDAR, radar, ego motion, calibration-aware fusion, multi-view context, and temporal inputs are deliberately out of scope and should not be inferred from the results.
 """
