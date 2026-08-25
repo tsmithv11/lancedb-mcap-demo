@@ -24,9 +24,11 @@ cells = [
 
 ## A multi-log MCAP → LanceDB → full-VLM-training experiment
 
+**Note:** this is for example purposes to demonstrate curation and model training using LanceDB.
+
 **Research question.** Can a quality-filtered, perceptually and semantically deduplicated subset of autonomous-driving images match or beat full-model post-training on every available frame when both runs receive the same optimizer-update budget?
 
-**Populated reference run.** Curated full training reached **0.563 macro F1** versus **0.537** for raw full training. It used 161 instead of 187 unique frames (**14% fewer**), while both runs received 187 optimizer updates and took essentially the same time (95.5 versus 96.2 seconds). Strict JSON compliance improved from **75.8% to 87.9%**. A paired bootstrap over the nine held-out logs gives a 95% interval of **−0.031 to +0.091** for the macro-F1 difference, so the observed win is promising but not statistically decisive. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
+**Populated reference run.** Curated full training reached **0.563 macro F1** versus **0.537** for raw full training. It used 161 instead of 187 unique frames (**14% fewer**), while both runs received 187 optimizer updates and took essentially the same time (95.5 versus 96.2 seconds). Strict JSON compliance improved from **75.8% to 87.9%**. A paired bootstrap over the nine held-out logs gives a 95% interval of **−0.031 to +0.091** for the macro-F1 difference. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
 
 This notebook builds compact MCAP logs from the official nuImages mini release, ingests them into one LanceDB table, computes governed feature columns, curates the training split with a LanceDB Feature Engineering UDTF, and fully fine-tunes a 256M open vision-language model directly from LanceDB rows. It compares the vanilla model, full training on all rows, and full training on curated rows.
 
@@ -180,7 +182,7 @@ if DEVICE.type == "cpu" and not ALLOW_CPU_FULL_TRAINING:
         r"""
 ## 1. From public driving data to independent MCAP logs
 
-MCAP is a log container for timestamped robotics messages. The earlier one-scene version of this demo could not support a credible held-out evaluation, so this version uses the official nuImages mini archive: 50 annotated samples from 44 separate driving logs in Boston and Singapore.
+MCAP is a log container for timestamped robotics messages. This version uses the official nuImages mini archive: 50 annotated samples from 44 separate driving logs in Boston and Singapore.
 
 nuImages distributes annotated keyframes plus nearby unannotated sweeps. We normalize each sample into a compact MCAP containing the annotated camera frame and three neighboring frames on either side. The keyframe labels are propagated only within ±1.5 seconds, and every row records that temporal distance. Splits are assigned by complete driving log, never by adjacent frame.
 """
@@ -620,7 +622,7 @@ plt.tight_layout(); plt.show()
         r"""
 ## 5. Curate with a cross-row UDTF
 
-This is the operation that should not be expressed as a row UDF: rarity, balancing, and deduplication depend on other rows. A beta LanceDB Feature Engineering UDTF reads the training query, performs the deterministic cross-row decision, and materializes an auditable decision table. The resulting columns are then merged back into the source table.
+This is the operation that should not be expressed as a row UDF: rarity, balancing, and deduplication depend on other rows. A UDTF reads the training query, performs the deterministic cross-row decision, and materializes an auditable decision table. The resulting columns are then merged back into the source table.
 
 The local UDTF executor uses Ray. If a restricted environment prevents Ray from starting, the notebook invokes the **same declared UDTF** in-process and clearly records the executor fallback; it does not maintain a second curation algorithm.
 """
@@ -768,7 +770,7 @@ plt.tight_layout(); plt.show()
 
 This version performs **full fine-tuning**, not LoRA: every language, connector, and vision parameter is trainable. The model is intentionally small—SmolVLM-256M in bfloat16—so two one-epoch runs remain practical on Apple Silicon or an NVIDIA GPU. The code verifies that the vision tower is trainable and reports the trainable parameter count.
 
-There is no image-folder bridge. The dataset keeps only frame IDs in memory; each `__getitem__` performs a LanceDB point query for `model_image` and `label_text`, decodes the bytes, and passes the image to the processor. `num_workers=0` is intentional because the in-process LanceDB table handle stays in the training process.
+The dataset keeps only frame IDs in memory; each `__getitem__` performs a LanceDB point query for `model_image` and `label_text`, decodes the bytes, and passes the image to the processor. `num_workers=0` is intentional because the in-process LanceDB table handle stays in the training process.
 
 Raw and curated conditions use identical learning rate, model initialization, sample-order seed, and **optimizer-step budget**. The curated set is smaller, so its deterministic sampler starts a second shuffled pass to reach the same number of updates as raw. This isolates data selection from training compute; the comparison no longer handicaps curation by giving it fewer learning opportunities.
 """
