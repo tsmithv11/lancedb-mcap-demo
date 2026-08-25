@@ -209,6 +209,12 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Local notebook caches and generated experiment artifacts.
+# The populated notebook is tracked; source MCAPs, Lance tables, model caches,
+# adapters, and prediction caches are reproducible but intentionally local.
+data/
+artifacts/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
