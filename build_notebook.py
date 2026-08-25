@@ -26,11 +26,11 @@ cells = [
 
 **Note:** this is for example purposes to demonstrate curation and model training using LanceDB.
 
-**Research question.** Can a quality-filtered, perceptually and semantically deduplicated subset of autonomous-driving images match or beat full-model post-training on every available frame when both runs receive the same optimizer-update budget?
+**Research question.** Can a conservatively quality-filtered subset of autonomous-driving images match or beat full-model post-training on every available frame when both runs receive the same optimizer-update budget?
 
-**Populated reference run.** Curated full training reached **0.563 macro F1** versus **0.537** for raw full training. It used 161 instead of 187 unique frames (**14% fewer**), while both runs received 187 optimizer updates and took essentially the same time (95.5 versus 96.2 seconds). Strict JSON compliance improved from **75.8% to 87.9%**. A paired bootstrap over the nine held-out logs gives a 95% interval of **−0.031 to +0.091** for the macro-F1 difference. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
+**Populated reference run.** With `StreamingDataset`, quality-only curated full training reached **0.544 macro F1** versus **0.542** for raw full training. It used 182 instead of 187 unique frames (**3% fewer**), while both runs received 187 optimizer updates and took essentially the same time (89.5 versus 89.0 seconds). Strict JSON compliance was **90.9% for both conditions**. A paired bootstrap over the nine held-out logs gives a 95% interval of **−0.025 to +0.035** for the macro-F1 difference. The vanilla model produced no contract-valid outputs and therefore scored zero under the intentionally strict parser.
 
-This notebook builds compact MCAP logs from the official nuImages mini release, ingests them into one LanceDB table, computes governed feature columns, curates the training split with a LanceDB Feature Engineering UDTF, and fully fine-tunes a 256M open vision-language model directly from LanceDB rows. It compares the vanilla model, full training on all rows, and full training on curated rows.
+This notebook builds compact MCAP logs from the official nuImages mini release, ingests them into one LanceDB table, computes governed feature columns, curates the training split with a LanceDB Feature Engineering UDTF, and fully fine-tunes a 256M open vision-language model through LanceDB's `StreamingDataset` API. It compares the vanilla model, full training on all rows, and full training on curated rows.
 
 The task is **driving-scene tagging**, not vehicle control. Ground truth comes from nuImages 2D annotations. The notebook uses all six camera positions represented in the mini release; it does not use LiDAR, radar, CAN state, multi-camera fusion, or temporal model inputs.
 
@@ -129,6 +129,7 @@ MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"
 MODEL_IMAGE_SIZE = (512, 512)
 LEARNING_RATE = 1e-5
 VALIDATION_LOSS_EXAMPLES = 12
+SWEEP_WINDOW_US = 1_500_000  # Keyframe plus up to three past and three future frames.
 
 LABELS = [
     "pedestrian_present", "car_present", "large_vehicle", "two_wheeler",
@@ -141,9 +142,9 @@ QUESTION = (
     "two_wheeler includes bicycles and motorcycles; dense_scene means at least 12 annotated objects."
 )
 
-SEMANTIC_COSINE_THRESHOLD = 0.98
-SEMANTIC_DHASH_GUARD = 18
-PERCEPTUAL_HAMMING_THRESHOLD = 5
+SEMANTIC_COSINE_THRESHOLD = 2.0  # Disabled for the quality-only training ablation.
+SEMANTIC_DHASH_GUARD = -1
+PERCEPTUAL_HAMMING_THRESHOLD = -1
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -311,13 +312,13 @@ def sample_chain(sample):
         current = sample_data[current["prev"]]
     chain = []
     while current:
-        if abs(current["timestamp"] - sample["timestamp"]) <= 1_500_000:
+        if abs(current["timestamp"] - sample["timestamp"]) <= SWEEP_WINDOW_US:
             chain.append(current)
         current = sample_data[current["next"]] if current["next"] else None
     return chain
 
 conversion_spec = {
-    "source_sha256": SOURCE_SHA256, "window_us": 1_500_000,
+    "source_sha256": SOURCE_SHA256, "window_us": SWEEP_WINDOW_US,
     "split_seed": split_seed, "labels": LABELS,
 }
 conversion_fingerprint = hashlib.sha256(json.dumps(conversion_spec, sort_keys=True).encode()).hexdigest()
@@ -565,7 +566,7 @@ display(table.search().select(["frame_id", "brightness", "blur_score", "semantic
 
 Adjacent camera frames can be redundant in two different senses. A low dHash Hamming distance finds nearly unchanged pixels. A high semantic cosine similarity finds frames whose learned visual content is almost equivalent even when exposure, crop, or small object motion changes.
 
-For removal, the semantic rule is deliberately conservative: cosine similarity must be at least **0.98**, the dHash distance must also be at most **18**, the labels must match, and comparison stays inside one short sample sequence. This threshold is calibrated from the observed training-distance tail; semantic similarity alone never deletes a row.
+The similarity columns remain useful for inspection and audit, but this small-data ablation does not delete rows on similarity alone. With only 28 annotated training keyframes, adjacent views act as useful temporal augmentation. Training curation therefore removes only failed image-quality checks while always protecting directly annotated keyframes.
 """
     ),
     code(
@@ -622,7 +623,7 @@ plt.tight_layout(); plt.show()
         r"""
 ## 5. Curate with a cross-row UDTF
 
-This is the operation that should not be expressed as a row UDF: rarity, balancing, and deduplication depend on other rows. A UDTF reads the training query, performs the deterministic cross-row decision, and materializes an auditable decision table. The resulting columns are then merged back into the source table.
+The UDTF reads the complete training query and materializes an auditable decision table, including quality, rarity, and nearest-neighbor evidence. On this small reference split, the training policy is deliberately conservative: it protects every annotated keyframe, removes only five sweep frames that fail the image-quality checks, and retains temporal neighbors as useful augmentation. The similarity evidence remains available for inspection and for stricter policies on larger datasets.
 
 The local UDTF executor uses Ray. If a restricted environment prevents Ray from starting, the notebook invokes the **same declared UDTF** in-process and clearly records the executor fallback; it does not maintain a second curation algorithm.
 """
@@ -766,23 +767,34 @@ plt.tight_layout(); plt.show()
     ),
     md(
         r"""
-## 6. Full-model training directly from LanceDB
+## 6. Full-model training with LanceDB `StreamingDataset`
 
 This version performs **full fine-tuning**, not LoRA: every language, connector, and vision parameter is trainable. The model is intentionally small—SmolVLM-256M in bfloat16—so two one-epoch runs remain practical on Apple Silicon or an NVIDIA GPU. The code verifies that the vision tower is trainable and reports the trainable parameter count.
 
-The dataset keeps only frame IDs in memory; each `__getitem__` performs a LanceDB point query for `model_image` and `label_text`, decodes the bytes, and passes the image to the processor. `num_workers=0` is intentional because the in-process LanceDB table handle stays in the training process.
+`StreamingDataset` pushes each condition's SQL filter and two-column projection into LanceDB, builds a deterministic shuffled permutation for each epoch, and overlaps Arrow-batch reads with training. The trainer therefore does not materialize frame IDs or issue one point query per sample. The same API can scale to multiple workers and distributed ranks; this compact single-process run uses one split so no remainder rows are dropped from either condition.
 
-Raw and curated conditions use identical learning rate, model initialization, sample-order seed, and **optimizer-step budget**. The curated set is smaller, so its deterministic sampler starts a second shuffled pass to reach the same number of updates as raw. This isolates data selection from training compute; the comparison no longer handicaps curation by giving it fewer learning opportunities.
+Raw and curated conditions use identical learning rate, model initialization, shuffle seed, and **optimizer-step budget**. The curated set is smaller, so its stream starts a second deterministically reshuffled epoch to reach the same number of updates as raw. This isolates data selection from training compute; the comparison no longer handicaps curation by giving it fewer learning opportunities.
 """
     ),
     code(
         r"""
+from lancedb.streaming import StreamingDataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
+
+STREAM_READ_BATCH_SIZE = 8
+STREAM_PREFETCH_BATCHES = 2
+# Feature Engineering returns a compatible table wrapper; StreamingDataset currently
+# requires the native local LanceTable, so reopen the same versioned table locally.
+stream_table = lancedb.connect(DB_DIR).open_table(TABLE_NAME)
 
 training_config = {
     "model": MODEL_ID, "full_finetune": True, "train_vision": True,
     "optimizer_step_policy": "equal_to_raw_train_rows", "optimizer_steps": raw_count,
     "learning_rate": LEARNING_RATE, "batch_size": 1,
+    "data_loader": "lancedb.streaming.StreamingDataset",
+    "stream_read_batch_size": STREAM_READ_BATCH_SIZE,
+    "stream_prefetch_batches": STREAM_PREFETCH_BATCHES,
+    "stream_num_splits": 1,
     "model_image_size": MODEL_IMAGE_SIZE, "question": QUESTION,
     "seed": SEED, "source_sha256": SOURCE_SHA256,
     "curation": {
@@ -808,39 +820,46 @@ def load_model(path=MODEL_ID):
     model.generation_config.pad_token_id = 2
     return model
 
-class LanceVisionDataset:
-    def __init__(self, table, predicate, processor):
-        self.table, self.processor = table, processor
-        self.frame_ids = sorted(r["frame_id"] for r in table.search().where(predicate).select(["frame_id"]).to_arrow().to_pylist())
-    def __len__(self): return len(self.frame_ids)
-    def record(self, index):
-        frame_id = self.frame_ids[index]
-        result = (self.table.search().where(f"frame_id = '{frame_id}'")
-                  .select(["frame_id", "model_image", "label_text", "labels"]).limit(1).to_arrow().to_pylist())
-        if len(result) != 1: raise KeyError(frame_id)
-        return result[0]
-    def __getitem__(self, index):
-        row = self.record(index)
-        image = Image.open(io.BytesIO(row["model_image"])).convert("RGB")
-        user = {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": QUESTION}]}
-        assistant = {"role": "assistant", "content": [{"type": "text", "text": row["label_text"]}]}
-        encoded = self.processor.apply_chat_template([user, assistant], add_generation_prompt=False,
-                                                     tokenize=True, return_dict=True, return_tensors="pt")
-        prompt = self.processor.apply_chat_template([user], add_generation_prompt=True,
-                                                    tokenize=True, return_dict=True, return_tensors="pt")
-        labels = encoded["input_ids"].clone()
-        labels[:, :prompt["input_ids"].shape[1]] = -100
-        encoded["labels"] = labels
-        return {k: v.to(DEVICE) for k, v in encoded.items() if torch.is_tensor(v)}
+def make_lance_stream(predicate, *, epoch, shuffle):
+    return StreamingDataset(
+        stream_table,
+        num_splits=1,  # Exact coverage: neither training condition is divisible by a common larger split count.
+        shuffle=shuffle,
+        shuffle_seed=SEED,
+        epoch=epoch,
+        read_batch_size=STREAM_READ_BATCH_SIZE,
+        prefetch_batches=STREAM_PREFETCH_BATCHES,
+        columns=["model_image", "label_text"],
+        filter=predicate,
+        transform_parallelism=1,
+    )
+
+def encode_training_row(row, processor):
+    with Image.open(io.BytesIO(row["model_image"])) as source:
+        image = source.convert("RGB")
+    user = {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": QUESTION}]}
+    assistant = {"role": "assistant", "content": [{"type": "text", "text": row["label_text"]}]}
+    encoded = processor.apply_chat_template([user, assistant], add_generation_prompt=False,
+                                            tokenize=True, return_dict=True, return_tensors="pt")
+    prompt = processor.apply_chat_template([user], add_generation_prompt=True,
+                                           tokenize=True, return_dict=True, return_tensors="pt")
+    labels = encoded["input_ids"].clone()
+    labels[:, :prompt["input_ids"].shape[1]] = -100
+    encoded["labels"] = labels
+    return {k: v.to(DEVICE) for k, v in encoded.items() if torch.is_tensor(v)}
 
 def mean_validation_loss(model, processor):
-    dataset = LanceVisionDataset(table, "split = 'validation'", processor)
-    positions = np.linspace(0, len(dataset) - 1, min(VALIDATION_LOSS_EXAMPLES, len(dataset)), dtype=int)
+    predicate = "split = 'validation'"
+    num_examples = table.count_rows(predicate)
+    positions = set(np.linspace(0, num_examples - 1, min(VALIDATION_LOSS_EXAMPLES, num_examples), dtype=int))
+    dataset = make_lance_stream(predicate, epoch=0, shuffle=False)
     losses = []
     model.eval()
     with torch.inference_mode():
-        for i in positions:
-            losses.append(float(model(**dataset[int(i)]).loss.detach().cpu()))
+        for index, row in enumerate(dataset):
+            if index in positions:
+                encoded = encode_training_row(row, processor)
+                losses.append(float(model(**encoded).loss.detach().cpu()))
     model.train()
     return float(np.mean(losses))
 
@@ -863,23 +882,32 @@ def train_full_model(name, predicate):
     if trainable_params != total_params or not vision_trainable:
         raise RuntimeError("Full fine-tuning invariant failed: not every parameter, including vision, is trainable")
     model.config.use_cache = False
-    dataset = LanceVisionDataset(table, predicate, processor)
+    num_examples = table.count_rows(predicate)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     history, started = [], time.perf_counter()
     model.train()
     optimizer_steps = raw_count
+    stream_bytes_loaded, stream_fetch_seconds, stream_transform_seconds = 0, 0.0, 0.0
     completed, cycle = 0, 0
     progress = tqdm(total=optimizer_steps, desc=f"Full-train {name}")
     while completed < optimizer_steps:
-        generator = torch.Generator().manual_seed(SEED + cycle)
-        order = torch.randperm(len(dataset), generator=generator).tolist()
-        for index in order[:optimizer_steps - completed]:
-            optimizer.zero_grad(set_to_none=True)
-            loss = model(**dataset[index]).loss
-            if not torch.isfinite(loss): raise RuntimeError(f"Non-finite loss at step {completed + 1}: {loss}")
-            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-            value = float(loss.detach().cpu()); history.append(value); completed += 1; progress.update(1)
-            if completed % 10 == 0: progress.set_postfix(loss=f"{np.mean(history[-10:]):.3f}")
+        dataset = make_lance_stream(predicate, epoch=cycle, shuffle=True)
+        iterator = iter(dataset)
+        try:
+            for _ in range(min(num_examples, optimizer_steps - completed)):
+                row = next(iterator)
+                encoded = encode_training_row(row, processor)
+                optimizer.zero_grad(set_to_none=True)
+                loss = model(**encoded).loss
+                if not torch.isfinite(loss): raise RuntimeError(f"Non-finite loss at step {completed + 1}: {loss}")
+                loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+                value = float(loss.detach().cpu()); history.append(value); completed += 1; progress.update(1)
+                if completed % 10 == 0: progress.set_postfix(loss=f"{np.mean(history[-10:]):.3f}")
+        finally:
+            iterator.close()
+        stream_bytes_loaded += dataset.bytes_loaded
+        stream_fetch_seconds += dataset.fetch_time
+        stream_transform_seconds += dataset.transform_time
         cycle += 1
     progress.close()
     if DEVICE.type == "mps": torch.mps.synchronize()
@@ -891,10 +919,12 @@ def train_full_model(name, predicate):
     processor.save_pretrained(checkpoint)
     stats = {
         "condition": name, "fingerprint": experiment_fingerprint, "checkpoint": str(checkpoint),
-        "examples": len(dataset), "examples_seen": optimizer_steps,
-        "effective_epochs": optimizer_steps / len(dataset), "optimizer_steps": optimizer_steps,
-        "seconds": elapsed, "examples_per_second": len(dataset) / elapsed,
+        "examples": num_examples, "examples_seen": optimizer_steps,
+        "effective_epochs": optimizer_steps / num_examples, "optimizer_steps": optimizer_steps,
+        "seconds": elapsed, "examples_per_second": optimizer_steps / elapsed,
         "final_train_loss_10_step_mean": float(np.mean(history[-10:])), "validation_loss": validation_loss,
+        "data_loader": "LanceDB StreamingDataset", "stream_bytes_loaded": stream_bytes_loaded,
+        "stream_fetch_seconds": stream_fetch_seconds, "stream_transform_seconds": stream_transform_seconds,
         "total_parameters": total_params, "trainable_parameters": trainable_params,
         "vision_trainable": vision_trainable, "full_finetune": True,
     }
@@ -908,7 +938,7 @@ raw_stats = train_full_model("raw", "split = 'train'")
 curated_stats = train_full_model("curated", "split = 'train' AND retained_curated = true")
 training_stats = pd.DataFrame([raw_stats, curated_stats])
 display(training_stats[["condition", "examples", "examples_seen", "effective_epochs", "optimizer_steps", "seconds", "validation_loss",
-                        "trainable_parameters", "vision_trainable", "full_finetune"]].style.format({
+                        "stream_bytes_loaded", "trainable_parameters", "vision_trainable", "full_finetune"]].style.format({
     "seconds": "{:.1f}", "effective_epochs": "{:.2f}", "validation_loss": "{:.3f}", "trainable_parameters": "{:,}"}))
 """
     ),
@@ -1040,11 +1070,11 @@ ci_low, ci_high = np.quantile(bootstrap_deltas, [.025, .975])
 win_probability = np.mean(np.asarray(bootstrap_deltas) > 0)
 
 conclusion = (
-    f"The curated point estimate improved macro F1 by {delta:+.3f} with {efficiency:.0%} fewer unique "
+    f"The curated point estimate changed macro F1 by {delta:+.3f} with {efficiency:.0%} fewer unique "
     f"frames at the same {raw_stats['optimizer_steps']}-update budget. Its log-cluster bootstrap 95% interval "
     f"is [{ci_low:+.3f}, {ci_high:+.3f}] (positive in {win_probability:.1%} of resamples)."
 )
-display(Markdown(f"### Observed result\n\n**{conclusion}**\n\nBecause the interval includes zero, this run shows an observed advantage—not proof that curation will win generally. The correct next step is a larger official split and multiple training seeds, not test-set threshold tuning."))
+display(Markdown(f"### Observed result\n\n**{conclusion}**\n\nBecause the interval includes zero, this small run does not establish a performance difference. The correct next step is a larger official split and multiple training seeds, not test-set threshold tuning."))
 
 positions = sorted(set([0, len(test_ids)//3, 2*len(test_ids)//3, len(test_ids)-1]))
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -1069,7 +1099,7 @@ plt.tight_layout(); plt.show()
 |---|---|---|
 | **MCAP** | 50 compact, timestamped camera/annotation logs normalized from the public nuImages mini archive | The upstream release is an image dataset; the notebook performs the MCAP normalization explicitly |
 | **Lance** | Source JPEG, model-ready JPEG, typed metadata, labels, features, and curation audit columns | Additional image representations consume storage but eliminate a loose-file training cache |
-| **LanceDB OSS** | Local table creation, point reads during training, SQL-style filters, merges, and exact/vector search | The trainer is PyTorch; LanceDB supplies records but does not perform gradient updates |
+| **LanceDB OSS** | Local table creation, filtered/projected/shuffled streaming reads during training, merges, and exact/vector search | `StreamingDataset` supplies records to the PyTorch trainer but does not perform gradient updates |
 | **LanceDB Feature Engineering** | Versioned row UDF backfills plus a real cross-row UDTF materialized view for curation | The UDTF API is beta; restricted runtimes may use the same UDTF through the documented in-process executor fallback |
 | **Full VLM training** | All 256M parameters, including the vision tower, update on Metal/CUDA/CPU | This is scene tagging, not detection, tracking, sensor fusion, or an autonomous-driving policy |
 | **LanceDB Enterprise** | **Not used** | At larger scale it can add managed distributed execution/serving, independent compute and storage, caching, indexing, compaction, concurrency, and object-store operation |
