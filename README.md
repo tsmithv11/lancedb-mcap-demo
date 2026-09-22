@@ -30,7 +30,7 @@ Both training conditions use the same optimizer-update budget. The reference exp
 
 ![Completed notebook evaluation showing the results tables, held-out macro F1 chart, and observed result with its bootstrap interval.](docs/images/notebook-results.png)
 
-[View the full completed notebook results](docs/images/notebook-full-results.png) (long PNG, approximately 6 MB). This capture includes every section, output table, chart, sample image, and run log, with code inputs hidden. Open the image at full size to read the details.
+[View the full completed notebook results](docs/images/notebook-full-results.png) (long PNG, approximately 6 MB). This capture includes every section, output table, chart, sample image, and run log, with code inputs hidden and repeated blank log lines collapsed. Open the image at full size to read the details.
 
 Screenshot of the notebook's rendered evaluation section from the [saved reference run](https://github.com/tsmithv11/lancedb-mcap-demo/blob/8c0eaa07e4457eb49f9cb7f4e83a83a3b3e8dd8e/robotics_data_curation_post_training.ipynb), with code inputs hidden. The curated model changed macro F1 by +0.003 using 3% fewer unique training frames at the same 187-update budget. The 95% log-cluster bootstrap interval is [-0.025, +0.035], so this small run does not establish a performance difference. Results will vary across runs.
 
