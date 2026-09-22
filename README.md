@@ -2,7 +2,35 @@
 
 An end-to-end notebook showing how to turn public nuImages driving data into MCAP logs, ingest them into LanceDB, curate training rows with LanceDB Feature Engineering, and fine-tune a small vision-language model for driving-scene tagging.
 
-The experiment compares the vanilla model with full-model training on all frames and on a quality-filtered subset. The checked-in notebook includes the populated reference results.
+The experiment compares the vanilla model with full-model training on all training frames and on a quality-filtered subset. A screenshot of the completed reference run is included below.
+
+## How it works
+
+```mermaid
+flowchart TD
+    A[Public nuImages mini driving data] --> E[Split by independent driving log]
+    E --> B[Timestamped camera and annotation MCAP logs]
+    B --> C[LanceDB multimodal table: images, labels, and log metadata]
+    C --> D[Feature Engineering: model-ready images, quality, and embeddings]
+    D --> F[All training frames]
+    F --> G[Quality curation with auditable decisions]
+    F --> H[StreamingDataset: full-model training on raw frames]
+    G --> I[StreamingDataset: full-model training on curated frames]
+    J[Vanilla SmolVLM-256M] --> K[Evaluate on the same held-out test logs]
+    H --> K
+    I --> K
+    D --> L[Held-out test frames]
+    L --> K
+    K --> M[F1, JSON compliance, and log-cluster bootstrap]
+```
+
+Both training conditions use the same optimizer-update budget. The reference experiment filters for quality; it computes redundancy features but disables deduplication for this comparison.
+
+## Completed notebook run
+
+![Completed notebook evaluation showing the results tables, held-out macro F1 chart, and observed result with its bootstrap interval.](docs/images/notebook-results.png)
+
+Screenshot of the notebook's rendered evaluation section from the [saved reference run](https://github.com/tsmithv11/lancedb-mcap-demo/blob/8c0eaa07e4457eb49f9cb7f4e83a83a3b3e8dd8e/robotics_data_curation_post_training.ipynb), with code inputs hidden. The curated model changed macro F1 by +0.003 using 3% fewer unique training frames at the same 187-update budget. The 95% log-cluster bootstrap interval is [-0.025, +0.035], so this small run does not establish a performance difference. Results will vary across runs.
 
 ## Run it
 
@@ -21,7 +49,8 @@ The first run downloads roughly 118 MB of nuImages data, a 45 MB feature extract
 
 ## Files
 
-- `robotics_data_curation_post_training.ipynb` — the runnable experiment and reference output.
+- `robotics_data_curation_post_training.ipynb` — the runnable experiment.
+- `docs/images/notebook-results.png` — evaluation screenshot from the completed reference run.
 - `build_notebook.py` — regenerates the notebook source with `python build_notebook.py`.
 
 This is a compact research demonstration of scene tagging, not a vehicle-control, detection, or sensor-fusion system.
